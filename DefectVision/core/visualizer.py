@@ -40,7 +40,7 @@ class Visualizer:
     ) -> np.ndarray:
         x, y, w, h = roi
         if searching:
-            color = _GRAY
+            color = _YELLOW
         elif warming_up:
             color = _YELLOW
         elif confirmed_defect:
