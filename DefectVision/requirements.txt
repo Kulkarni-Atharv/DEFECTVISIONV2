@@ -1,0 +1,11 @@
+# DefectVision — Print Defect Inspection System
+# Install with:  pip install -r requirements.txt
+
+# Core computer vision
+opencv-python>=4.8.0
+
+# SSIM with full spatial map (structural_similarity with full=True)
+scikit-image>=0.21.0
+
+# Numerical computing
+numpy>=1.24.0

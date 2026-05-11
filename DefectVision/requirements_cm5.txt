@@ -1,0 +1,29 @@
+# DefectVision — Raspberry Pi CM5 deployment requirements
+#
+# STEP 1 — system OpenCV (GTK-backed, works on Pi OS — do NOT use pip opencv):
+#   sudo apt install -y python3-opencv
+#
+# STEP 2 — core packages:
+#   python3 -m venv venv --system-site-packages
+#   source venv/bin/activate
+#   pip install -r requirements_cm5.txt
+#
+# STEP 3 — PyTorch CPU-only (only needed for capture_cm5.py / CRAFT):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+#   DO NOT run: pip install torch   <-- pulls 1.5 GB of CUDA libraries on ARM Linux
+#
+# STEP 4 — Picamera2:
+#   sudo apt install -y python3-picamera2
+#
+# NOTE: Do NOT install opencv-python via pip on the Pi.
+#   The PyPI build uses Qt which fails on Pi OS Bookworm (Wayland).
+#   The apt package (python3-opencv) uses GTK and works correctly.
+#
+# CRAFT source files (craft.py, craft_utils.py, imgproc.py, refinenet.py)
+# must be present in the repo root.  Clone from:
+#   https://github.com/clovaai/CRAFT-pytorch
+
+# opencv is provided by system apt (python3-opencv) — not listed here
+scikit-image>=0.21.0
+numpy>=1.24.0
