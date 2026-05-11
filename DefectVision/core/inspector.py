@@ -44,7 +44,7 @@ _CANNY_HIGH = 120
 _MIN_CONTOUR_AREA = 15
 # Morphology kernel for cleaning the binary defect mask before contouring.
 _MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-# Dilation kernel applied to the text mask — absorbs small positional shifts
+# Dilation applied to the text mask — absorbs small positional shifts
 # and movement halos at stroke boundaries without masking real defects.
 _TEXT_MASK_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
 
@@ -67,9 +67,11 @@ class Inspector:
                  threshold.  Fast sanity check; down-weighted in the
                  composite to avoid noise sensitivity.
 
-    All three signals are evaluated *within the text mask only*, so
-    background lighting variation and movement halos outside the ink
-    region do not contribute to the defect score.
+    Pixel diff and edge diff count changed pixels only within the text/ink
+    mask, so background lighting variation does not contribute to the score.
+    Ratios are still normalised by the full ROI area so existing thresholds
+    remain calibrated.  Defect localisation contours are also constrained to
+    the text mask.
     """
 
     def __init__(self) -> None:
@@ -93,12 +95,10 @@ class Inspector:
         if reference.shape != live.shape:
             live = cv2.resize(live, (reference.shape[1], reference.shape[0]))
 
-        # Effective area for ratio normalisation: text pixels, or full frame if no mask.
         mask_valid = (
             self._text_mask is not None
             and np.count_nonzero(self._text_mask) > 0
         )
-        mask_area = int(np.count_nonzero(self._text_mask)) if mask_valid else reference.size
 
         # ---- 1. SSIM -------------------------------------------------
         # win_size must be odd and <= min image dimension
@@ -106,29 +106,29 @@ class Inspector:
         win = win if win % 2 == 1 else win - 1
         win = max(win, 3)
 
-        _, ssim_map = ssim_fn(
+        ssim_score, ssim_map = ssim_fn(
             reference, live,
             full=True,
             data_range=255,
             win_size=win,
             gaussian_weights=True,
         )
+        # Use the global SSIM scalar — text-edge pixels have naturally lower
+        # local SSIM even for identical images (high-contrast gradients), so
+        # averaging only within the text mask produces a falsely low baseline.
+        result.ssim_score = float(ssim_score)
         result.ssim_map = ssim_map
-
-        # Average SSIM only within the text region — background lighting
-        # shifts no longer drag the score down.
-        if mask_valid:
-            result.ssim_score = float(ssim_map[self._text_mask > 0].mean())
-        else:
-            result.ssim_score = float(ssim_map.mean())
 
         # ---- 2. Pixel difference (text region only) -----------------
         diff = cv2.absdiff(reference, live)
         result.diff_map = diff
         defective_pixels = diff > PIXEL_DIFF_THRESHOLD
         if mask_valid:
+            # Zero-out background pixels so they don't count.
             defective_pixels = defective_pixels & (self._text_mask > 0)
-        result.pixel_diff_score = float(np.count_nonzero(defective_pixels) / mask_area)
+        # Normalise by full ROI area — keeps thresholds calibrated the same
+        # way as before; the only change is background pixels are excluded.
+        result.pixel_diff_score = float(np.count_nonzero(defective_pixels) / diff.size)
 
         # ---- 3. Edge difference (text region only) ------------------
         live_edges = self._edges(live)
@@ -138,12 +138,12 @@ class Inspector:
         result.edge_diff_map = edge_diff
         if mask_valid:
             edge_in_mask = cv2.bitwise_and(edge_diff, self._text_mask)
-            result.edge_diff_score = float(np.count_nonzero(edge_in_mask) / mask_area)
+            result.edge_diff_score = float(np.count_nonzero(edge_in_mask) / edge_diff.size)
         else:
             result.edge_diff_score = float(np.count_nonzero(edge_diff) / edge_diff.size)
 
         # ---- 4. Composite defect score ------------------------------
-        ssim_component  = float(np.clip(1.0 - result.ssim_score, 0.0, 1.0))
+        ssim_component  = float(np.clip(1.0 - ssim_score, 0.0, 1.0))
         edge_component  = float(np.clip(result.edge_diff_score  * EDGE_SCORE_SCALE,  0.0, 1.0))
         pixel_component = float(np.clip(result.pixel_diff_score * PIXEL_SCORE_SCALE, 0.0, 1.0))
 
@@ -168,6 +168,8 @@ class Inspector:
         defect_heat = np.uint8(np.clip((1.0 - ssim_map) * 255, 0, 255))
         _, defect_mask = cv2.threshold(defect_heat, 50, 255, cv2.THRESH_BINARY)
         if mask_valid:
+            # Restrict contour search to the text region only — prevents
+            # background SSIM noise from producing spurious bounding boxes.
             defect_mask = cv2.bitwise_and(defect_mask, self._text_mask)
         defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_CLOSE, _MORPH_KERNEL)
         defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_OPEN,  _MORPH_KERNEL)
