@@ -24,76 +24,74 @@ PICAMERA2_FPS      = 30
 PICAMERA2_WARMUP_S = 2.0    # AEC/AWB settle time (seconds)
 
 # ---- Reference capture --------------------------------------
-REFERENCE_FRAME_COUNT = 10   # Frames averaged to build the clean reference
-REFERENCE_WARMUP_FRAMES = 10 # Discard this many frames before capturing (sensor warm-up)
+REFERENCE_FRAME_COUNT   = 10   # Frames averaged to build the clean reference
+REFERENCE_WARMUP_FRAMES = 10   # Discard this many frames before capturing
 
 # ---- Preprocessing ------------------------------------------
-CLAHE_CLIP_LIMIT = 2.0
+CLAHE_CLIP_LIMIT     = 2.0
 CLAHE_TILE_GRID_SIZE = (8, 8)
-DENOISE_KERNEL_SIZE = 3      # Gaussian blur kernel size (must be odd); 1 = disabled
+DENOISE_KERNEL_SIZE  = 3       # Gaussian blur kernel (must be odd); 1 = disabled
 
-# ---- Alignment (phase correlation) --------------------------
-ALIGN_ENABLED = True
-# Max fraction of ROI size allowed as shift — rejects unreliable correlations.
-# With position lock active, template-match variance can be 10-15 px, so this
-# must be large enough for the aligner to cover that residual offset.
-ALIGN_MAX_SHIFT_RATIO = 0.25  # 25 % of ROI width/height (was 0.08)
+# Background normalisation: estimate the slow-varying illumination gradient
+# by blurring with a large Gaussian, then divide the image by it.
+# This removes bottle-surface texture and uneven lighting before CLAHE.
+# Set to 0 to disable.
+TOPHAT_BG_SIGMA = 25           # Gaussian sigma for background estimation
 
-# ---- Inspection thresholds ----------------------------------
-# SSIM: 0 = completely different, 1 = identical
-SSIM_THRESHOLD = 0.80
-SSIM_WIN_SIZE = 5            # Smaller window = catches finer / more localised defects
+# ---- Alignment ----------------------------------------------
+ALIGN_ENABLED         = True
+ALIGN_MAX_SHIFT_RATIO = 0.25   # Max translation as fraction of ROI dimension
+ALIGN_MAX_ROTATION_DEG = 5.0   # Reject ECC result if estimated rotation > this
 
-# Edge difference: fraction of pixels whose edges differ
-EDGE_DIFF_THRESHOLD = 0.06
+# ECC (Enhanced Correlation Coefficient) parameters.
+# ECC handles translation + rotation; far more robust than phase correlation.
+ALIGN_ECC_MAX_ITER = 50        # Max iterations per frame
+ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 
-# Raw pixel difference: absolute intensity difference per pixel (0–255)
-PIXEL_DIFF_THRESHOLD = 15    # Lowered from 30 — catches subtle debris and fine strings
+# ---- Text binarisation (inspector) --------------------------
+# Adaptive mean threshold: each (BLOCK × BLOCK) tile uses its own mean.
+ADAPTIVE_BLOCK_SIZE     = 31   # Must be odd; reduce for tiny text
+ADAPTIVE_C              = 8    # Constant subtracted from local mean
+TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real text
 
-# ---- Hard pixel-change override -----------------------------
-# If this fraction of ROI pixels exceeds PIXEL_DIFF_THRESHOLD, the frame is
-# flagged as defective immediately — regardless of the composite SSIM score.
-# This catches thin strings, fine debris, and small text additions that
-# affect only a small area but are clearly real changes.
-# Set to 0.0 to disable and rely on composite score only.
-CHANGED_PIXEL_RATIO_THRESHOLD = 0.07    # 7 % — raised from 0.8 % because 1-px
-# letter-edge halos on a moving object routinely affect 5–7 % of ROI pixels.
+# ---- Text-structure comparison weights ----------------------
+# Defect score = RECALL_W*(1−recall) + PURITY_W*(1−purity) + NCC_W*(1−ncc)
+RECALL_WEIGHT = 0.50           # Missing ink / broken / faded characters
+PURITY_WEIGHT = 0.25           # Extra ink / smear / debris
+NCC_WEIGHT    = 0.25           # Overall structural shape mismatch
 
-# ---- Defect scoring (weighted combination) ------------------
-SSIM_WEIGHT   = 0.50
-EDGE_WEIGHT   = 0.25
-PIXEL_WEIGHT  = 0.25
-
-# Scaling factors that normalise edge/pixel fraction scores into [0, 1].
-# Lower values = more tolerant of alignment-induced edge halos on moving objects.
-# Raise them back toward 6.0 / 12.0 for a static-camera setup.
-EDGE_SCORE_SCALE  = 4.0   # applied to edge_diff_score  (was hardcoded 6.0)
-PIXEL_SCORE_SCALE = 8.0   # applied to pixel_diff_score (was hardcoded 12.0)
-
-# Combined defect score: 0.0 = perfect, 1.0 = severe defect.
-# Raised from 0.18 — moving-object alignment noise raises the baseline score.
-DEFECT_SCORE_THRESHOLD = 0.32
+# ---- Defect decision ----------------------------------------
+DEFECT_SCORE_THRESHOLD = 0.20  # 0 = no defect, 1 = worst; tuned for binary-mask scoring
 
 # ---- Temporal consistency filter ----------------------------
-# Prevents single noisy frames from triggering false alarms.
-TEMPORAL_WINDOW = 6          # Slightly shorter for faster response
-TEMPORAL_DEFECT_RATIO = 0.50 # 50 % of window frames must flag (was 60 %)
+TEMPORAL_WINDOW       = 6      # Rolling window length (frames)
+TEMPORAL_DEFECT_RATIO = 0.50   # Fraction of window frames that must flag defect
 
 # ---- Visualization ------------------------------------------
-HEATMAP_ALPHA = 0.45         # 0 = no heatmap, 1 = full heatmap overlay
+HEATMAP_ALPHA        = 0.45    # 0 = no heatmap overlay, 1 = full
 ROI_BORDER_THICKNESS = 3
-PANEL_CELL_SCALE = 2.5       # Display scale multiplier for each panel cell
-CORNER_ACCENT_LENGTH = 18    # Length of corner bracket lines on main feed
+PANEL_CELL_SCALE     = 2.5     # Display scale multiplier per panel cell
+CORNER_ACCENT_LENGTH = 18      # Length of corner bracket lines on main feed
 
-# ---- Position Lock (moving object tracking) -------------------------
-# Replaces the fixed-ROI crop with template matching so the print region
-# is found dynamically each frame, regardless of conveyor position.
+# ---- Position Lock (moving object tracking) -----------------
 POSITION_LOCK_ENABLED        = True
-POSITION_LOCK_THRESHOLD      = 0.72   # min normalised match confidence (0–1)
-POSITION_LOCK_SEARCH_MARGIN  = 80     # px around last position for fast search
-POSITION_LOCK_BLUR_THRESHOLD = 30.0   # Laplacian variance below this = skip frame; 0 = disabled
+POSITION_LOCK_THRESHOLD      = 0.72
+POSITION_LOCK_SEARCH_MARGIN  = 80
+POSITION_LOCK_BLUR_THRESHOLD = 30.0
 
 # ---- Logging ------------------------------------------------
-LOG_ENABLED = True
-LOG_DIR = "logs"
-SNAPSHOT_ON_DEFECT = False   # Auto-save ROI image on every confirmed defect
+LOG_ENABLED        = True
+LOG_DIR            = "logs"
+SNAPSHOT_ON_DEFECT = False
+
+# ---- Legacy parameters (kept for reference; not used by current inspector) --
+SSIM_THRESHOLD              = 0.80
+SSIM_WIN_SIZE               = 5
+EDGE_DIFF_THRESHOLD         = 0.06
+PIXEL_DIFF_THRESHOLD        = 15
+CHANGED_PIXEL_RATIO_THRESHOLD = 0.0
+SSIM_WEIGHT                 = 0.50
+EDGE_WEIGHT                 = 0.25
+PIXEL_WEIGHT                = 0.25
+EDGE_SCORE_SCALE            = 4.0
+PIXEL_SCORE_SCALE           = 8.0

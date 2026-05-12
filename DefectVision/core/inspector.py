@@ -2,89 +2,86 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim_fn
 from config import (
-    SSIM_THRESHOLD,
-    SSIM_WIN_SIZE,
-    EDGE_DIFF_THRESHOLD,
-    PIXEL_DIFF_THRESHOLD,
-    SSIM_WEIGHT,
-    EDGE_WEIGHT,
-    PIXEL_WEIGHT,
-    EDGE_SCORE_SCALE,
-    PIXEL_SCORE_SCALE,
+    ADAPTIVE_BLOCK_SIZE,
+    ADAPTIVE_C,
+    TEXT_MIN_COMPONENT_AREA,
+    RECALL_WEIGHT,
+    PURITY_WEIGHT,
+    NCC_WEIGHT,
     DEFECT_SCORE_THRESHOLD,
-    CHANGED_PIXEL_RATIO_THRESHOLD,
 )
 
 
 @dataclass
 class InspectionResult:
-    # Scalar metrics (0 = perfect, higher = worse for diff/edge scores)
+    # ---- Scalar scores (kept compatible with visualiser) ----------------
+    # ssim_score  → NCC structural similarity   (1 = identical, 0 = different)
+    # edge_diff_score → missing-text ratio      (0 = nothing missing)
+    # pixel_diff_score → extra-ink ratio        (0 = no extra ink)
     ssim_score: float = 1.0
     edge_diff_score: float = 0.0
     pixel_diff_score: float = 0.0
-    defect_score: float = 0.0       # Weighted composite: 0 = OK, 1 = severe
+    defect_score: float = 0.0
     is_defect: bool = False
 
-    # Per-pixel maps (same spatial size as the ROI)
-    ssim_map: np.ndarray | None = None       # float64, range [−1, 1]
-    diff_map: np.ndarray | None = None       # uint8, absolute intensity diff
-    edge_diff_map: np.ndarray | None = None  # uint8, binary edge disagreement
+    # ---- Per-pixel maps -------------------------------------------------
+    ssim_map: np.ndarray | None = None       # float64 [0,1]: 1=OK 0=defect (for heatmap)
+    diff_map: np.ndarray | None = None       # uint8: missing | extra pixels
+    edge_diff_map: np.ndarray | None = None  # uint8: missing-ink binary map
 
-    # Localisation
+    # ---- Localisation ---------------------------------------------------
     defect_contours: list = field(default_factory=list)
     defect_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
-# Canny thresholds tuned for small industrial text; adjust in config if needed.
-_CANNY_LOW = 40
-_CANNY_HIGH = 120
-# Minimum contour area (px²) to report as a discrete defect region.
+# Morphology kernels
+_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_OPEN_KERNEL  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+_DILATE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 _MIN_CONTOUR_AREA = 15
-# Morphology kernel for cleaning the binary defect mask before contouring.
-_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-# Dilation applied to the text mask — absorbs small positional shifts
-# and movement halos at stroke boundaries without masking real defects.
-_TEXT_MASK_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
 
 
 class Inspector:
     """
-    Core inspection engine.
+    Text-structure inspection engine.
 
-    Three complementary signals are combined into a single defect score:
+    Instead of comparing raw pixel intensities (SSIM / pixel-diff / edge-diff),
+    this engine compares the *binary ink structure* of the text:
 
-      1. SSIM  — captures structural / luminance / contrast changes.
-                 Best at detecting blurry ink, missing characters, and
-                 debris that alters the overall texture.
+      1. Both reference and live are adaptively thresholded into binary
+         ink masks — completely immune to illumination differences.
 
-      2. Edge diff — XOR of Canny edge maps.
-                 Catches broken or missing strokes even when overall
-                 brightness is unchanged (transparent/micro debris).
+      2. Three targeted signals are computed on those masks:
 
-      3. Pixel diff — raw absolute intensity difference after a mild
-                 threshold.  Fast sanity check; down-weighted in the
-                 composite to avoid noise sensitivity.
+         Recall  — fraction of reference ink pixels present in the live frame.
+                   Catches missing characters, faded ink, broken strokes.
 
-    Pixel diff and edge diff count changed pixels only within the text/ink
-    mask, so background lighting variation does not contribute to the score.
-    Ratios are still normalised by the full ROI area so existing thresholds
-    remain calibrated.  Defect localisation contours are also constrained to
-    the text mask.
+         Purity  — inverse fraction of extra ink in live relative to reference.
+                   Catches smears, debris, added characters, bleed.
+
+         NCC     — normalised cross-correlation of the two binary masks.
+                   Catches structural distortion even when pixel counts match.
+
+      3. Composite defect score:
+            score = RECALL_W × (1−recall) + PURITY_W × (1−purity) + NCC_W × (1−ncc)
+
+    Because comparison operates on ink masks, ROI background, bottle surface,
+    roller movement, and illumination variation are completely invisible to
+    the algorithm.
     """
 
     def __init__(self) -> None:
-        self._ref_edges: np.ndarray | None = None
-        self._text_mask: np.ndarray | None = None  # 255 = text/ink region
+        self._ref_bin: np.ndarray | None = None   # cleaned binary reference mask
+        self._ref_area: int = 0                    # number of ink pixels in reference
 
     # ------------------------------------------------------------------
     # Reference setup
     # ------------------------------------------------------------------
     def set_reference(self, ref_gray: np.ndarray) -> None:
-        """Cache reference edges and text mask so they are not recomputed every frame."""
-        self._ref_edges = self._edges(ref_gray)
-        self._text_mask = self._compute_text_mask(ref_gray)
+        """Binarise and cache the reference ink mask."""
+        self._ref_bin  = self._binarize(ref_gray)
+        self._ref_area = max(int(np.count_nonzero(self._ref_bin)), 1)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -95,116 +92,118 @@ class Inspector:
         if reference.shape != live.shape:
             live = cv2.resize(live, (reference.shape[1], reference.shape[0]))
 
-        mask_valid = (
-            self._text_mask is not None
-            and np.count_nonzero(self._text_mask) > 0
-        )
+        # Recompute reference bin if not yet set (safety guard)
+        if self._ref_bin is None or self._ref_bin.shape != reference.shape:
+            self.set_reference(reference)
 
-        # ---- 1. SSIM -------------------------------------------------
-        # win_size must be odd and <= min image dimension
-        win = min(SSIM_WIN_SIZE, reference.shape[0], reference.shape[1])
-        win = win if win % 2 == 1 else win - 1
-        win = max(win, 3)
+        ref_bin  = self._ref_bin
+        ref_area = self._ref_area
 
-        ssim_score, ssim_map = ssim_fn(
-            reference, live,
-            full=True,
-            data_range=255,
-            win_size=win,
-            gaussian_weights=True,
-        )
-        # Use the global SSIM scalar — text-edge pixels have naturally lower
-        # local SSIM even for identical images (high-contrast gradients), so
-        # averaging only within the text mask produces a falsely low baseline.
-        result.ssim_score = float(ssim_score)
-        result.ssim_map = ssim_map
+        # ---- Binarise live frame ----------------------------------------
+        live_bin = self._binarize(live)
 
-        # ---- 2. Pixel difference (text region only) -----------------
-        diff = cv2.absdiff(reference, live)
-        result.diff_map = diff
-        defective_pixels = diff > PIXEL_DIFF_THRESHOLD
-        if mask_valid:
-            # Zero-out background pixels so they don't count.
-            defective_pixels = defective_pixels & (self._text_mask > 0)
-        # Normalise by full ROI area — keeps thresholds calibrated the same
-        # way as before; the only change is background pixels are excluded.
-        result.pixel_diff_score = float(np.count_nonzero(defective_pixels) / diff.size)
+        # ---- Signal 1: Recall — missing ink -----------------------------
+        # Pixels that are ink in reference but not in live.
+        missing = cv2.bitwise_and(ref_bin, cv2.bitwise_not(live_bin))
+        recall  = 1.0 - float(np.count_nonzero(missing)) / ref_area
 
-        # ---- 3. Edge difference (text region only) ------------------
-        live_edges = self._edges(live)
-        if self._ref_edges is None:
-            self._ref_edges = self._edges(reference)
-        edge_diff = cv2.bitwise_xor(self._ref_edges, live_edges)
-        result.edge_diff_map = edge_diff
-        if mask_valid:
-            edge_in_mask = cv2.bitwise_and(edge_diff, self._text_mask)
-            result.edge_diff_score = float(np.count_nonzero(edge_in_mask) / edge_diff.size)
-        else:
-            result.edge_diff_score = float(np.count_nonzero(edge_diff) / edge_diff.size)
+        # ---- Signal 2: Purity — extra ink -------------------------------
+        # Pixels that are ink in live but not in reference (normalised by
+        # ref_area so the score is relative to expected ink volume).
+        extra   = cv2.bitwise_and(live_bin, cv2.bitwise_not(ref_bin))
+        purity  = 1.0 - float(np.count_nonzero(extra)) / ref_area
 
-        # ---- 4. Composite defect score ------------------------------
-        ssim_component  = float(np.clip(1.0 - ssim_score, 0.0, 1.0))
-        edge_component  = float(np.clip(result.edge_diff_score  * EDGE_SCORE_SCALE,  0.0, 1.0))
-        pixel_component = float(np.clip(result.pixel_diff_score * PIXEL_SCORE_SCALE, 0.0, 1.0))
+        # ---- Signal 3: NCC — structural shape ---------------------------
+        ref_f  = ref_bin.astype(np.float64)
+        live_f = live_bin.astype(np.float64)
+        ref_m  = ref_f  - ref_f.mean()
+        live_m = live_f - live_f.mean()
+        denom  = np.sqrt(np.sum(ref_m ** 2) * np.sum(live_m ** 2))
+        ncc    = float(np.sum(ref_m * live_m) / (denom + 1e-8))
+        ncc    = float(np.clip(ncc, 0.0, 1.0))
 
+        # ---- Composite score --------------------------------------------
         defect_score = (
-            SSIM_WEIGHT   * ssim_component +
-            EDGE_WEIGHT   * edge_component +
-            PIXEL_WEIGHT  * pixel_component
+            RECALL_WEIGHT * (1.0 - recall) +
+            PURITY_WEIGHT * float(np.clip(1.0 - purity, 0.0, 1.0)) +
+            NCC_WEIGHT    * (1.0 - ncc)
         )
-        result.defect_score = float(np.clip(defect_score, 0.0, 1.0))
-        result.is_defect = result.defect_score >= DEFECT_SCORE_THRESHOLD
+        result.defect_score    = float(np.clip(defect_score, 0.0, 1.0))
+        result.is_defect       = result.defect_score >= DEFECT_SCORE_THRESHOLD
 
-        # ---- Hard pixel-change override (within text region) --------
-        # Catches thin debris, strings, and fine additions that affect only
-        # a small area — their SSIM impact is too low to reach the composite
-        # threshold, but the raw pixel count is unambiguous.
-        if (CHANGED_PIXEL_RATIO_THRESHOLD > 0
-                and result.pixel_diff_score >= CHANGED_PIXEL_RATIO_THRESHOLD):
-            result.is_defect = True
-            result.defect_score = max(result.defect_score, DEFECT_SCORE_THRESHOLD)
+        # ---- Map to legacy fields (visualiser compatibility) ------------
+        result.ssim_score        = ncc              # structure similarity
+        result.edge_diff_score   = 1.0 - recall     # missing-text ratio
+        result.pixel_diff_score  = float(np.clip(1.0 - purity, 0.0, 1.0))  # extra-ink ratio
 
-        # ---- 5. Defect localisation (constrained to text region) ----
-        defect_heat = np.uint8(np.clip((1.0 - ssim_map) * 255, 0, 255))
-        _, defect_mask = cv2.threshold(defect_heat, 50, 255, cv2.THRESH_BINARY)
-        if mask_valid:
-            # Restrict contour search to the text region only — prevents
-            # background SSIM noise from producing spurious bounding boxes.
-            defect_mask = cv2.bitwise_and(defect_mask, self._text_mask)
-        defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_CLOSE, _MORPH_KERNEL)
-        defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_OPEN,  _MORPH_KERNEL)
+        # diff_map: union of missing and extra pixels → pixel-diff panel
+        result.diff_map      = cv2.add(missing, extra)
+        result.edge_diff_map = missing
+
+        # ssim_map: float [0,1] used by heatmap renderer (1=OK, 0=defect)
+        synth = np.ones(reference.shape, dtype=np.float64)
+        synth[missing > 0] = 0.0   # missing ink → hot (most severe)
+        synth[extra   > 0] = 0.35  # extra ink   → warm
+        result.ssim_map = synth
+
+        # ---- Defect localisation ----------------------------------------
+        defect_px = cv2.add(missing, extra)
+        defect_px = cv2.morphologyEx(defect_px, cv2.MORPH_CLOSE,  _DILATE_KERNEL)
+        defect_px = cv2.morphologyEx(defect_px, cv2.MORPH_DILATE, _DILATE_KERNEL)
 
         contours, _ = cv2.findContours(
-            defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            defect_px, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         result.defect_contours = [c for c in contours if cv2.contourArea(c) >= _MIN_CONTOUR_AREA]
-        result.defect_bboxes = [cv2.boundingRect(c) for c in result.defect_contours]
+        result.defect_bboxes   = [cv2.boundingRect(c) for c in result.defect_contours]
 
         return result
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Binarisation
     # ------------------------------------------------------------------
     @staticmethod
-    def _edges(img: np.ndarray) -> np.ndarray:
-        return cv2.Canny(img, _CANNY_LOW, _CANNY_HIGH)
-
-    @staticmethod
-    def _compute_text_mask(gray: np.ndarray) -> np.ndarray:
+    def _binarize(gray: np.ndarray) -> np.ndarray:
         """
-        Binary mask isolating ink/text pixels from the background.
+        Convert preprocessed gray image to a clean binary ink mask.
 
-        Uses Otsu thresholding (lighting-independent) to separate text from
-        background, then dilates by ~11 px to absorb small positional shifts
-        and stroke-edge halos without masking real defects.
-
-        Handles both dark-on-light and light-on-dark text automatically:
-        whichever binary class occupies the minority of pixels is treated
-        as the text region.
+        Steps:
+          1. Adaptive mean threshold — each local tile uses its own mean,
+             so uneven illumination across the ROI has no effect.
+          2. Auto-detect polarity — dark text on light bg or vice versa.
+          3. Morphological cleanup — connect broken strokes, remove noise.
+          4. Small-component filter — discard isolated noise dots.
         """
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        # If more than half the pixels are marked as "text", the polarity is
-        # wrong (light text on dark bg) — flip it.
-        if np.count_nonzero(mask) > gray.size * 0.5:
-            mask = cv2.bitwise_not(mask)
-        return cv2.dilate(mask, _TEXT_MASK_KERNEL, iterations=2)
+        h, w = gray.shape
+
+        # Block size must be odd and ≤ min image dimension
+        block = ADAPTIVE_BLOCK_SIZE
+        block = min(block, h, w)
+        if block % 2 == 0:
+            block -= 1
+        block = max(block, 3)
+
+        # THRESH_BINARY_INV: dark pixels (ink on bright bg) → white
+        bin_mask = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            block, ADAPTIVE_C,
+        )
+
+        # Polarity guard: text is the minority; if >50% is white, invert
+        if np.count_nonzero(bin_mask) > gray.size * 0.5:
+            bin_mask = cv2.bitwise_not(bin_mask)
+
+        # Connect broken strokes and remove single-pixel noise
+        bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, _CLOSE_KERNEL)
+        bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN,  _OPEN_KERNEL)
+
+        # Remove tiny components (sensor noise, CLAHE artefacts)
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+        cleaned = np.zeros_like(bin_mask)
+        for i in range(1, n_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= TEXT_MIN_COMPONENT_AREA:
+                cleaned[labels == i] = 255
+
+        return cleaned

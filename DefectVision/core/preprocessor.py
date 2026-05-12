@@ -1,7 +1,12 @@
 from __future__ import annotations
 import cv2
 import numpy as np
-from config import CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID_SIZE, DENOISE_KERNEL_SIZE
+from config import (
+    CLAHE_CLIP_LIMIT,
+    CLAHE_TILE_GRID_SIZE,
+    DENOISE_KERNEL_SIZE,
+    TOPHAT_BG_SIGMA,
+)
 
 
 class Preprocessor:
@@ -9,9 +14,16 @@ class Preprocessor:
     Converts a raw BGR ROI into a lighting-normalised grayscale image
     ready for structural comparison.
 
-    Pipeline: BGR → Gray → Gaussian denoise → CLAHE
-    CLAHE compensates for up to ~20 % lighting variation while preserving
-    the fine contrast needed to detect micro-level print defects.
+    Pipeline:
+        BGR → Gray → Gaussian denoise → Background normalisation → CLAHE
+
+    Background normalisation step:
+        Estimates the slow-varying illumination gradient (bottle-surface
+        texture, curved surface, lighting angle) by blurring the image with
+        a large Gaussian kernel.  Dividing by this background estimate and
+        rescaling to a mean of 128 removes the gradient while preserving the
+        sharp ink strokes.  This is far more effective than CLAHE alone for
+        handling uneven lighting across the ROI.
     """
 
     def __init__(self) -> None:
@@ -19,14 +31,46 @@ class Preprocessor:
             clipLimit=CLAHE_CLIP_LIMIT,
             tileGridSize=CLAHE_TILE_GRID_SIZE,
         )
-        # Validated odd kernel size; 1 = no blur
         ks = DENOISE_KERNEL_SIZE if DENOISE_KERNEL_SIZE % 2 == 1 else DENOISE_KERNEL_SIZE + 1
         self._blur_ksize = (ks, ks) if ks > 1 else None
+
+        # Pre-compute background estimation kernel size from sigma.
+        # ksize must be odd and large enough to span several characters so
+        # only the slow background gradient is captured, not the text itself.
+        if TOPHAT_BG_SIGMA > 0:
+            ksize = int(6 * TOPHAT_BG_SIGMA) | 1  # next odd number ≥ 6σ
+            self._bg_ksize = (ksize, ksize)
+            self._bg_sigma = float(TOPHAT_BG_SIGMA)
+        else:
+            self._bg_ksize = None
+            self._bg_sigma = 0.0
 
     def process(self, roi_bgr: np.ndarray) -> np.ndarray:
         """Return a preprocessed uint8 grayscale image."""
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Denoise
         if self._blur_ksize:
             gray = cv2.GaussianBlur(gray, self._blur_ksize, 0)
+
+        # Background normalisation — remove illumination gradient.
+        # Result is centred at 128: background ≈ 128, ink deviates from it.
+        if self._bg_ksize is not None:
+            gray = self._normalise_background(gray)
+
+        # Local contrast enhancement
         gray = self._clahe.apply(gray)
         return gray
+
+    def _normalise_background(self, gray: np.ndarray) -> np.ndarray:
+        # Clamp kernel to image size (small ROIs)
+        h, w = gray.shape
+        kh = min(self._bg_ksize[0], h | 1)   # keep odd
+        kw = min(self._bg_ksize[1], w | 1)
+        kh = kh if kh % 2 == 1 else kh - 1
+        kw = kw if kw % 2 == 1 else kw - 1
+        kh, kw = max(kh, 3), max(kw, 3)
+
+        bg = cv2.GaussianBlur(gray, (kw, kh), self._bg_sigma)
+        # scale * src1 / src2 — uint8 result is automatically clipped to [0,255]
+        return cv2.divide(gray, bg, scale=128.0)
