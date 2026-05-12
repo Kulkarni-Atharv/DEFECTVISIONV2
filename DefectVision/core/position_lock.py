@@ -81,15 +81,19 @@ class PositionLock:
 
     def find(
         self, frame_gray: np.ndarray
-    ) -> tuple[tuple[int, int, int, int], float] | None:
+    ) -> tuple[tuple[int, int, int, int], float, int] | None:
         """
         Search for any of the stored templates in *frame_gray*.
 
         Returns
         -------
-        ((x, y, w, h), confidence)  in frame pixel coordinates
+        ((x, y, w, h), confidence, template_index)  in frame pixel coordinates
         (adjusted to the full drawn ROI when roi_offset is set), or
         None if the print is not found or the frame is too blurry.
+
+        *template_index* is the index into self._templates that gave the best
+        match — callers can use it to check the corresponding reference first
+        in the inspection loop, avoiding redundant ECC alignment calls.
         """
         fh, fw = frame_gray.shape
 
@@ -107,11 +111,12 @@ class PositionLock:
             ox, oy = 0, 0
 
         # --- match all templates, keep the best NCC ----------------------
-        best_conf = -1.0
+        best_conf  = -1.0
         best_mx, best_my = 0, 0
         best_tw, best_th = self._tw, self._th
+        best_idx   = 0
 
-        for tpl in self._templates:
+        for i, tpl in enumerate(self._templates):
             th_t, tw_t = tpl.shape[:2]
             if th_t > region.shape[0] or tw_t > region.shape[1]:
                 continue
@@ -123,6 +128,7 @@ class PositionLock:
                 best_my   = loc[1] + oy
                 best_tw   = tw_t
                 best_th   = th_t
+                best_idx  = i
 
         if best_conf < self._match_thr:
             self._last_pos = None
@@ -148,9 +154,9 @@ class PositionLock:
             ry = max(0, my - oy_roi)
             rx = int(np.clip(rx, 0, fw - full_w))
             ry = int(np.clip(ry, 0, fh - full_h))
-            return (rx, ry, full_w, full_h), float(best_conf)
+            return (rx, ry, full_w, full_h), float(best_conf), best_idx
 
-        return (mx, my, best_tw, best_th), float(best_conf)
+        return (mx, my, best_tw, best_th), float(best_conf), best_idx
 
     def reset(self) -> None:
         """Call when a new reference is captured so the next find() does a

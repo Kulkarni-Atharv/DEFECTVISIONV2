@@ -27,6 +27,7 @@ from config import (
     LOG_DIR,
     POSITION_LOCK_ENABLED,
     MAX_REFERENCES, REF_MIN_DISTINCTNESS,
+    INSPECT_EARLY_EXIT_SCORE,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -254,6 +255,10 @@ def capture_reference_video(
                 diverse_bgr = _select_diverse_bgr_frames(
                     raw_bgr_frames, MAX_REFERENCES, REF_MIN_DISTINCTNESS,
                 )
+                # Release the large recording buffer immediately — 1000 frames
+                # at full resolution can exceed 4 GB; keeping them in memory
+                # while inspection runs causes lag from memory pressure.
+                raw_bgr_frames.clear()
 
                 ref_grays.clear()
                 ref_templates.clear()
@@ -266,6 +271,8 @@ def capture_reference_video(
                             target_hw = (cg.shape[0], cg.shape[1])
                         ref_grays.append(cg)
                         ref_templates.append(cr)
+
+                diverse_bgr.clear()  # done with the 7 full-frame BGR crops too
 
                 if ref_grays:
                     print(
@@ -368,12 +375,15 @@ def run_inspection(
                         paused = not paused
                     continue
 
-                # Convert ROI-relative coords to full-frame coords
-                (tx, ty, tw, th), match_conf = match
+                # Convert ROI-relative coords to full-frame coords.
+                # best_tpl_idx is the template that won — put that reference
+                # first so the inspection loop checks the closest angle first.
+                (tx, ty, tw, th), match_conf, best_tpl_idx = match
                 current_roi = (sx + tx, sy + ty, tw, th)
             else:
-                current_roi = roi
-                match_conf  = 1.0
+                current_roi  = roi
+                match_conf   = 1.0
+                best_tpl_idx = 0
 
             # ---- Extract and preprocess live ROI ---------------------
             roi_bgr   = _grab_roi(frame, current_roi)
@@ -387,16 +397,29 @@ def run_inspection(
                 )
 
             # ---- Align live to each reference, keep best match -------
+            # Check the angle that position lock already identified as the
+            # closest match first.  If it scores clean, skip the rest —
+            # this cuts 5-6 ECC calls per frame on the common (clean) path.
+            if position_lock is not None:
+                ordered_indices = [best_tpl_idx] + [
+                    i for i in range(len(ref_grays)) if i != best_tpl_idx
+                ]
+            else:
+                ordered_indices = list(range(len(ref_grays)))
+
             best_result = None
             best_ref    = ref_grays[0]
             best_live   = live_gray
-            for ref in ref_grays:
+            for i in ordered_indices:
+                ref     = ref_grays[i]
                 aligned = aligner.align(ref, live_gray)
                 res     = inspector.inspect(ref, aligned)
                 if best_result is None or res.defect_score < best_result.defect_score:
                     best_result = res
                     best_ref    = ref
                     best_live   = aligned
+                if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
+                    break  # clearly clean — no need to check remaining angles
             result    = best_result
             live_gray = best_live
 
