@@ -89,6 +89,14 @@ NCC_WEIGHT    = 0.25           # Overall structural shape mismatch
 # ---- Defect decision ----------------------------------------
 DEFECT_SCORE_THRESHOLD = 0.20  # 0 = no defect, 1 = worst; tuned for binary-mask scoring
 
+# ---- Multi-reference video calibration ----------------------
+# Record a short video of a clean print at different angles; the system
+# automatically picks up to MAX_REFERENCES frames that are structurally
+# distinct (pairwise NCC below REF_MIN_DISTINCTNESS).
+MAX_REFERENCES       = 7     # Hard cap on stored reference frames
+REF_MIN_DISTINCTNESS = 0.80  # NCC threshold: frame added only when NCC vs
+                              # every already-selected ref is below this value
+
 # ---- Temporal consistency filter ----------------------------
 TEMPORAL_WINDOW       = 6      # Rolling window length (frames)
 TEMPORAL_DEFECT_RATIO = 0.50   # Fraction of window frames that must flag defect

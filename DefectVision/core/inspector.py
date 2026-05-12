@@ -194,6 +194,32 @@ class Inspector:
         return result
 
     # ------------------------------------------------------------------
+    # Multi-reference entry point
+    # ------------------------------------------------------------------
+    def inspect_best(
+        self,
+        references: list,
+        live: np.ndarray,
+    ) -> tuple:
+        """
+        Run inspect() against every reference frame; return
+        (best_result, best_ref) where best_result has the lowest
+        defect_score (the reference that structurally matches live best).
+
+        Each reference gets its own set_reference() call so _ref_bin
+        is always correct for that specific frame.
+        """
+        best_result = None
+        best_ref    = references[0]
+        for ref in references:
+            self.set_reference(ref)
+            result = self.inspect(ref, live)
+            if best_result is None or result.defect_score < best_result.defect_score:
+                best_result = result
+                best_ref    = ref
+        return best_result, best_ref  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
     # Binarisation helpers
     # ------------------------------------------------------------------
     @staticmethod

@@ -26,6 +26,7 @@ from config import (
     REFERENCE_FRAME_COUNT, REFERENCE_WARMUP_FRAMES,
     LOG_DIR,
     POSITION_LOCK_ENABLED,
+    MAX_REFERENCES, REF_MIN_DISTINCTNESS,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -83,7 +84,52 @@ def _focused_template(
 
 
 # ====================================================================
-# Reference capture
+# Multi-reference helpers
+# ====================================================================
+
+def _frame_ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalised cross-correlation between two same-shape grayscale images."""
+    af = a.astype(np.float64)
+    bf = b.astype(np.float64)
+    am = af - af.mean()
+    bm = bf - bf.mean()
+    denom = np.sqrt(np.sum(am ** 2) * np.sum(bm ** 2))
+    return float(np.clip(np.sum(am * bm) / (denom + 1e-8), 0.0, 1.0))
+
+
+def _select_diverse_refs(
+    proc_frames: list,
+    raw_frames:  list,
+    max_refs: int,
+    min_distinctness: float,
+) -> tuple:
+    """
+    Walk through proc_frames and keep up to max_refs frames whose pairwise
+    NCC is below min_distinctness.  Returns (ref_grays, ref_templates).
+    """
+    if not proc_frames:
+        return [], []
+
+    # Subsample to at most 200 candidates so selection stays fast
+    step       = max(1, len(proc_frames) // 200)
+    indices    = list(range(0, len(proc_frames), step))
+
+    sel_proc = [proc_frames[indices[0]]]
+    sel_raw  = [raw_frames[indices[0]]]
+
+    for idx in indices[1:]:
+        if len(sel_proc) >= max_refs:
+            break
+        candidate = proc_frames[idx]
+        if all(_frame_ncc(candidate, r) < min_distinctness for r in sel_proc):
+            sel_proc.append(proc_frames[idx])
+            sel_raw.append(raw_frames[idx])
+
+    return sel_proc, sel_raw
+
+
+# ====================================================================
+# Reference capture (single averaged frame — kept for internal use)
 # ====================================================================
 
 def capture_reference(
@@ -127,43 +173,86 @@ def capture_reference(
 
 
 # ====================================================================
-# Reference capture UI
+# Reference capture UI — video-based multi-angle calibration
 # ====================================================================
 
-def wait_for_reference_capture(
+def capture_reference_video(
     cap,
     roi: tuple[int, int, int, int],
     preprocessor: Preprocessor,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[list, list] | None:
     """
-    Show a live preview with the ROI highlighted.
-    The user places a clean sample and presses SPACE to capture.
-    Returns (ref_gray, ref_template) or None on abort.
+    Record a short video of a clean print while the user tilts/rotates
+    the object through all expected orientations.  Diverse frames are
+    extracted automatically as the reference set.
+
+    Controls
+    --------
+    SPACE  — start recording (box turns red) / stop recording
+    Q      — confirm current references and proceed (or abort if none)
+
+    Returns
+    -------
+    (ref_grays, ref_templates)
+      ref_grays     — list of preprocessed uint8 grays (Inspector)
+      ref_templates — list of raw grayscale uint8 (PositionLock)
+    Returns None if the user quits without recording anything.
     """
-    WIN = "DefectVision — Reference Capture  [SPACE=capture] [Q=quit]"
+    WIN = "DefectVision — Video Reference Capture  [SPACE=start/stop  Q=confirm/quit]"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     x, y, w, h = roi
+
+    recording:   bool       = False
+    proc_frames: list       = []
+    raw_frames:  list       = []
+    ref_grays:   list       = []
+    ref_templates: list     = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
             continue
+
+        if recording:
+            crop = _grab_roi(frame, roi)
+            proc_frames.append(preprocessor.process(crop))
+            raw_frames.append(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+
         display = frame.copy()
-        cv2.rectangle(display, (x, y), (x + w, y + h), (0, 220, 255), 2)
-        cv2.putText(display,
-                    "Place CLEAN sample under camera  —  press SPACE to capture reference",
-                    (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
+        color   = (0, 0, 220) if recording else (0, 220, 255)
+        cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
+
+        if recording:
+            label = f"RECORDING  {len(proc_frames)} frames  |  SPACE = stop"
+        elif ref_grays:
+            label = (f"{len(ref_grays)} angle(s) captured  |  "
+                     f"Q = confirm  |  SPACE = re-record")
+        else:
+            label = "Tilt print through all expected angles  |  SPACE = start recording"
+
+        cv2.putText(display, label, (10, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
         cv2.imshow(WIN, display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord(' '):
-            print(f"[INFO] Capturing {REFERENCE_FRAME_COUNT} reference frames …")
-            ref_gray, ref_template = capture_reference(cap, roi, preprocessor)
-            cv2.destroyWindow(WIN)
-            return ref_gray, ref_template
+            if not recording:
+                recording = True
+                proc_frames.clear()
+                raw_frames.clear()
+                print("[INFO] Recording started — tilt the print through all expected orientations …")
+            else:
+                recording = False
+                print(f"[INFO] Stopped.  Selecting references from {len(proc_frames)} frames …")
+                ref_grays, ref_templates = _select_diverse_refs(
+                    proc_frames, raw_frames,
+                    MAX_REFERENCES, REF_MIN_DISTINCTNESS,
+                )
+                print(f"[INFO] {len(ref_grays)} distinct reference angle(s) selected.")
+
         elif key == ord('q'):
             cv2.destroyWindow(WIN)
-            return None
+            return (ref_grays, ref_templates) if ref_grays else None
 
 
 # ====================================================================
@@ -173,7 +262,8 @@ def wait_for_reference_capture(
 def run_inspection(
     cap,
     roi: tuple[int, int, int, int],
-    ref_gray: np.ndarray,
+    ref_grays: list,
+    ref_templates: list,
     preprocessor: Preprocessor,
     aligner: Aligner,
     inspector: Inspector,
@@ -182,7 +272,7 @@ def run_inspection(
     logger: DefectLogger,
     position_lock: PositionLock | None = None,
 ) -> None:
-    inspector.set_reference(ref_gray)
+    inspector.set_reference(ref_grays[0])
     temporal.reset()
     if position_lock is not None:
         position_lock.reset()
@@ -254,12 +344,21 @@ def run_inspection(
             roi_bgr   = _grab_roi(frame, current_roi)
             live_gray = preprocessor.process(roi_bgr)
 
-            # ---- Alignment: phase correlation corrects residual ±1-2 px
-            # jitter left over after template-match integer positioning.
-            live_gray = aligner.align(ref_gray, live_gray)
-
-            # ---- Structural inspection -------------------------------
-            result = inspector.inspect(ref_gray, live_gray)
+            # ---- Align live to each reference, keep best match -------
+            # Each reference may be at a different angle; aligning to the
+            # closest one minimises structural residuals before comparison.
+            best_result = None
+            best_ref    = ref_grays[0]
+            best_live   = live_gray
+            for ref in ref_grays:
+                aligned = aligner.align(ref, live_gray)
+                res     = inspector.inspect(ref, aligned)
+                if best_result is None or res.defect_score < best_result.defect_score:
+                    best_result = res
+                    best_ref    = ref
+                    best_live   = aligned
+            result    = best_result
+            live_gray = best_live
 
             # ---- Temporal consistency --------------------------------
             warming_up = not temporal.window_full
@@ -285,7 +384,7 @@ def run_inspection(
 
             # ---- Inspection panel ------------------------------------
             panel = visualizer.build_panel(
-                roi_bgr, ref_gray, live_gray,
+                roi_bgr, best_ref, live_gray,
                 result, confirmed_defect, smoothed_score, fps, warming_up, match_conf,
             )
             cv2.imshow(WIN_PANEL, panel)
@@ -304,20 +403,22 @@ def run_inspection(
             print(f"[INFO] {'Paused' if paused else 'Resumed'}")
 
         elif key == ord('r'):
-            print("[INFO] Recapturing reference — place CLEAN sample, then press SPACE …")
-            result = wait_for_reference_capture(cap, roi, preprocessor)
-            if result is not None:
-                ref_gray, ref_template = result
-                inspector.set_reference(ref_gray)
+            print("[INFO] Recapturing references — record video of clean sample …")
+            cap_result = capture_reference_video(cap, roi, preprocessor)
+            if cap_result is not None:
+                ref_grays, ref_templates = cap_result
+                inspector.set_reference(ref_grays[0])
                 temporal.reset()
                 if position_lock is not None:
-                    focused_tpl, tpl_offset = _focused_template(ref_gray, ref_template)
+                    focused_tpl, tpl_offset = _focused_template(
+                        ref_grays[0], ref_templates[0]
+                    )
                     position_lock.update_template(
                         focused_tpl,
                         roi_offset    = tpl_offset,
                         full_roi_size = (roi[2], roi[3]),
                     )
-                print("[INFO] Reference updated.")
+                print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
             else:
                 print("[INFO] Reference recapture cancelled.")
 
@@ -385,24 +486,25 @@ def main() -> None:
     visualizer   = Visualizer()
     logger       = DefectLogger()
 
-    # ---- Reference capture -----------------------------------------
-    ref_result = wait_for_reference_capture(cam, roi, preprocessor)
+    # ---- Reference capture (video — multi-angle) -------------------
+    ref_result = capture_reference_video(cam, roi, preprocessor)
     if ref_result is None:
         print("[INFO] Reference capture cancelled.  Exiting.")
         cam.release()
         sys.exit(0)
 
-    ref_gray, ref_template = ref_result
-    print(f"[INFO] Reference shape: {ref_gray.shape}  dtype: {ref_gray.dtype}")
+    ref_grays, ref_templates = ref_result
+    print(f"[INFO] {len(ref_grays)} reference angle(s) captured. "
+          f"Shape: {ref_grays[0].shape}  dtype: {ref_grays[0].dtype}")
 
     # ---- Position lock ---------------------------------------------
     position_lock: PositionLock | None = None
     if POSITION_LOCK_ENABLED:
-        inspector.set_reference(ref_gray)   # needed so _focused_template can binarise
-        focused_tpl, tpl_offset = _focused_template(ref_gray, ref_template)
+        inspector.set_reference(ref_grays[0])  # needed so _focused_template can binarise
+        focused_tpl, tpl_offset = _focused_template(ref_grays[0], ref_templates[0])
         position_lock = PositionLock(
             focused_tpl,
-            roi_offset   = tpl_offset,
+            roi_offset    = tpl_offset,
             full_roi_size = (roi[2], roi[3]),
         )
         print(
@@ -416,7 +518,7 @@ def main() -> None:
     # ---- Inspection loop -------------------------------------------
     try:
         run_inspection(
-            cam, roi, ref_gray,
+            cam, roi, ref_grays, ref_templates,
             preprocessor, aligner, inspector, temporal, visualizer, logger,
             position_lock,
         )
