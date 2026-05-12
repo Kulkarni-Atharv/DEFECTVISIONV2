@@ -120,7 +120,7 @@ PANEL_CELL_SCALE     = 2.5     # Display scale multiplier per panel cell
 CORNER_ACCENT_LENGTH = 18      # Length of corner bracket lines on main feed
 
 # ---- Position Lock (moving object tracking) -----------------
-POSITION_LOCK_ENABLED        = True
+POSITION_LOCK_ENABLED        = False
 POSITION_LOCK_THRESHOLD      = 0.45   # tight text-crop templates match at ~0.45+ even with angle/lighting variation
 POSITION_LOCK_SEARCH_MARGIN  = 80
 # Blur gate: Laplacian variance of matched crop must exceed this.
