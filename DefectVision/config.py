@@ -114,7 +114,7 @@ CORNER_ACCENT_LENGTH = 18      # Length of corner bracket lines on main feed
 
 # ---- Position Lock (moving object tracking) -----------------
 POSITION_LOCK_ENABLED        = True
-POSITION_LOCK_THRESHOLD      = 0.60   # lowered: large ROIs with varied bg give lower NCC
+POSITION_LOCK_THRESHOLD      = 0.45   # tight text-crop templates match at ~0.45+ even with angle/lighting variation
 POSITION_LOCK_SEARCH_MARGIN  = 80
 # Blur gate: Laplacian variance of matched crop must exceed this.
 # Large ROIs containing mostly smooth surface (bottle, label backing) score

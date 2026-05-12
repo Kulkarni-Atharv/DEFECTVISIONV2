@@ -66,35 +66,57 @@ def _select_diverse_bgr_frames(
     bgr_frames: list,
     max_refs: int,
     min_distinctness: float,
+    preprocessor: Preprocessor,
 ) -> list:
     """
-    Walk through bgr_frames and keep up to max_refs frames whose pairwise
-    NCC (computed at 0.25× scale for speed) is below min_distinctness.
-    Returns a list of BGR frames.
+    Walk through bgr_frames and keep up to max_refs frames whose TEXT
+    appearance is structurally distinct (pairwise NCC on text crops below
+    min_distinctness).
+
+    Using text crops — not a full-frame downsample — ensures that frames
+    where the print is at different angles are treated as distinct even when
+    the bottle surface dominates the full-frame signal.  Falls back to
+    uniform temporal sampling if no text is detected.
     """
     if not bgr_frames:
         return []
 
-    scale = 0.25
-    step  = max(1, len(bgr_frames) // 200)
+    n    = len(bgr_frames)
+    # Sample at most 60 candidates to bound preprocessing cost
+    step = max(1, n // 60)
+    candidates = list(range(0, n, step))
 
-    def small_gray(i: int) -> np.ndarray:
-        return cv2.cvtColor(
-            cv2.resize(bgr_frames[i], None, fx=scale, fy=scale),
-            cv2.COLOR_BGR2GRAY,
-        ).astype(np.float64)
+    # Extract text crop from each candidate frame
+    crops: dict[int, np.ndarray] = {}
+    for idx in candidates:
+        cg, _ = _auto_text_crop(bgr_frames[idx], preprocessor, target_hw=None, margin=20)
+        if cg is not None:
+            crops[idx] = cg.astype(np.float64)
 
-    indices   = list(range(0, len(bgr_frames), step))
-    sel_small = [small_gray(indices[0])]
-    sel_idx   = [indices[0]]
+    if not crops:
+        # No text detected in any sampled frame — fall back to uniform sampling
+        uniform_step = max(1, n // max_refs)
+        return [bgr_frames[i] for i in range(0, n, uniform_step)][:max_refs]
 
-    for idx in indices[1:]:
+    valid = list(crops.keys())
+    h0, w0 = crops[valid[0]].shape[:2]
+
+    def normed(idx: int) -> np.ndarray:
+        c = crops[idx]
+        if c.shape[:2] != (h0, w0):
+            c = cv2.resize(c, (w0, h0)).astype(np.float64)
+        return c
+
+    sel_idx   = [valid[0]]
+    sel_crops = [normed(valid[0])]
+
+    for idx in valid[1:]:
         if len(sel_idx) >= max_refs:
             break
-        s = small_gray(idx)
-        if all(_frame_ncc(s, r) < min_distinctness for r in sel_small):
-            sel_small.append(s)
+        c = normed(idx)
+        if all(_frame_ncc(c, r) < min_distinctness for r in sel_crops):
             sel_idx.append(idx)
+            sel_crops.append(c)
 
     return [bgr_frames[i] for i in sel_idx]
 
@@ -253,7 +275,7 @@ def capture_reference_video(
                 print(f"[INFO] Stopped.  Selecting references from {len(raw_bgr_frames)} frames …")
 
                 diverse_bgr = _select_diverse_bgr_frames(
-                    raw_bgr_frames, MAX_REFERENCES, REF_MIN_DISTINCTNESS,
+                    raw_bgr_frames, MAX_REFERENCES, REF_MIN_DISTINCTNESS, preprocessor,
                 )
                 # Release the large recording buffer immediately — 1000 frames
                 # at full resolution can exceed 4 GB; keeping them in memory
@@ -538,9 +560,18 @@ def main() -> None:
         sys.exit(0)
 
     ref_grays, ref_templates = ref_result
+    tpl_h, tpl_w = ref_grays[0].shape[:2]
     print(
         f"[INFO] {len(ref_grays)} reference angle(s) captured.  "
         f"Shape: {ref_grays[0].shape}  dtype: {ref_grays[0].dtype}"
+    )
+    # Advise minimum ROI size so the user draws a box large enough for the
+    # templates.  Add 20 % headroom so the text can move slightly within it.
+    min_roi_w = int(tpl_w * 1.20)
+    min_roi_h = int(tpl_h * 1.20)
+    print(
+        f"[INFO] Recommended minimum search ROI: {min_roi_w} × {min_roi_h} px  "
+        f"(draw a box at least this size in the next step)"
     )
 
     # ---- Step 2: Draw search ROI -----------------------------------
@@ -559,6 +590,12 @@ def main() -> None:
 
     x, y, rw, rh = roi
     print(f"[INFO] Search ROI: x={x} y={y} w={rw} h={rh}")
+    if rw < tpl_w or rh < tpl_h:
+        print(
+            f"[WARN] ROI ({rw}×{rh}) is smaller than the reference template "
+            f"({tpl_w}×{tpl_h}).  Position lock will use centre-cropped templates "
+            f"— tracking may be less reliable.  Consider re-drawing a larger ROI."
+        )
 
     # ---- Step 3: Position lock with all reference templates --------
     position_lock: PositionLock | None = None

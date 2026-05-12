@@ -116,10 +116,29 @@ class PositionLock:
         best_tw, best_th = self._tw, self._th
         best_idx   = 0
 
+        rh, rw = region.shape[:2]
+
         for i, tpl in enumerate(self._templates):
             th_t, tw_t = tpl.shape[:2]
-            if th_t > region.shape[0] or tw_t > region.shape[1]:
+
+            # If template is larger than the search region in any dimension,
+            # take the centre crop that fits — at 90 % of the region size so
+            # there is still a meaningful matching window.  Centre-cropping
+            # preserves original pixel resolution (text stroke widths stay the
+            # same) so NCC stays high, unlike down-scaling which blurs strokes.
+            if th_t > rh or tw_t > rw:
+                target_h = min(th_t, max(5, int(rh * 0.90)))
+                target_w = min(tw_t, max(5, int(rw * 0.90)))
+                if target_h < 5 or target_w < 5:
+                    continue
+                y0 = (th_t - target_h) // 2
+                x0 = (tw_t - target_w) // 2
+                tpl   = tpl[y0: y0 + target_h, x0: x0 + target_w]
+                th_t, tw_t = target_h, target_w
+
+            if th_t > rh or tw_t > rw:
                 continue
+
             res = cv2.matchTemplate(region, tpl, cv2.TM_CCOEFF_NORMED)
             _, conf, _, loc = cv2.minMaxLoc(res)
             if conf > best_conf:
