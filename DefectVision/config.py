@@ -55,11 +55,24 @@ ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 TEXT_BH_SIZE            = 21   # Blackhat/tophat kernel size (px); increase for large text
 TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real text
 
-# Tolerance dilation: before comparing missing/extra, both masks are dilated
-# by this many pixels so that sub-pixel stroke-boundary differences (caused
-# by slight lighting or threshold variation) are absorbed without hiding real
-# defects like missing characters or large smears.
-TEXT_TOLERANCE_PX       = 3
+# Tolerance dilation applied before missing / extra comparison.
+# Two separate values because the two signals have different sensitivity needs:
+#
+#   RECALL tolerance (missing ink): generous — stroke-boundary pixels can shift
+#     2-3 px with lighting/threshold changes; absorbing them prevents false
+#     "missing character" detections.
+#
+#   PURITY tolerance (extra ink): tight — we want to detect marks drawn ON or
+#     immediately beside a character stroke, so only 1 px of forgiveness is
+#     allowed.  Isolated noise at this scale is filtered by the component check.
+TEXT_TOLERANCE_RECALL_PX = 3
+TEXT_TOLERANCE_PURITY_PX = 1
+
+# Debris hard override: after extra-ink detection, find connected components.
+# Any single component ≥ this many px² that survived the purity tolerance is
+# genuine debris (dot, smear, added stroke) — flag as DEFECT immediately
+# regardless of composite score.
+DEBRIS_MIN_COMPONENT_AREA = 8
 
 # Legacy adaptive-threshold params (no longer used; kept for reference)
 ADAPTIVE_BLOCK_SIZE     = 31
