@@ -41,7 +41,7 @@ TOPHAT_BG_SIGMA = 25           # Gaussian sigma for background estimation
 # ---- Alignment ----------------------------------------------
 ALIGN_ENABLED         = True
 ALIGN_MAX_SHIFT_RATIO = 0.25   # Max translation as fraction of ROI dimension
-ALIGN_MAX_ROTATION_DEG = 5.0   # Reject ECC result if estimated rotation > this
+ALIGN_MAX_ROTATION_DEG = 10.0  # Reject ECC result if estimated rotation > this
 
 # ECC (Enhanced Correlation Coefficient) parameters.
 # ECC handles translation + rotation; far more robust than phase correlation.
@@ -62,17 +62,19 @@ TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real te
 #     2-3 px with lighting/threshold changes; absorbing them prevents false
 #     "missing character" detections.
 #
-#   PURITY tolerance (extra ink): tight — we want to detect marks drawn ON or
-#     immediately beside a character stroke, so only 1 px of forgiveness is
-#     allowed.  Isolated noise at this scale is filtered by the component check.
+#   PURITY tolerance (extra ink): 2 px absorbs typical stroke-boundary shifts
+#     from frame-to-frame lighting/alignment variation without masking real marks.
+#     1 px was too tight — it let boundary artifacts through as extra-ink clusters.
 TEXT_TOLERANCE_RECALL_PX = 3
-TEXT_TOLERANCE_PURITY_PX = 1
+TEXT_TOLERANCE_PURITY_PX = 2
 
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is
 # genuine debris (dot, smear, added stroke) — flag as DEFECT immediately
 # regardless of composite score.
-DEBRIS_MIN_COMPONENT_AREA = 8
+# 30 px² ≈ a 6×5 compact mark — well below any user-visible dot (~5 px radius
+# = 78 px²) but above stroke-boundary noise strips (typically thin and < 20 px²).
+DEBRIS_MIN_COMPONENT_AREA = 30
 
 # Legacy adaptive-threshold params (no longer used; kept for reference)
 ADAPTIVE_BLOCK_SIZE     = 31
