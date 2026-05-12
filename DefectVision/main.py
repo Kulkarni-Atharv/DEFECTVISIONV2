@@ -32,6 +32,7 @@ from config import (
     LOG_DIR,
     POSITION_LOCK_ENABLED,
     INSPECT_EARLY_EXIT_SCORE,
+    POSITION_LOCK_SINGLE_REF_CONF,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -280,18 +281,26 @@ def run_inspection(
                     (ref_grays[0].shape[1], ref_grays[0].shape[0]),
                 )
 
-            # ---- Align + inspect against all references --------------
-            # Check the angle identified by position lock first; exit early
-            # on the common clean-print path to save ECC calls.
-            ordered_indices = [best_tpl_idx] + [
-                i for i in range(len(ref_grays)) if i != best_tpl_idx
-            ]
+            # ---- Align + inspect against references ------------------
+            # Fast path: when position lock is confident (>= SINGLE_REF_CONF)
+            # the template index already tells us which angle is in frame —
+            # skip all other references and save N-1 ECC calls per frame.
+            # Slow path (low confidence or no position lock): check all angles
+            # ordered with the best-guess first, exit early when clearly clean.
+            idx = min(best_tpl_idx, len(ref_grays) - 1)
+            if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
+                check_indices = [idx]
+            else:
+                check_indices = [idx] + [
+                    i for i in range(len(ref_grays)) if i != idx
+                ]
 
             best_result = None
             best_ref    = ref_grays[0]
             best_live   = live_gray
-            for i in ordered_indices:
+            for i in check_indices:
                 ref     = ref_grays[i]
+                inspector.set_reference(ref)   # must update per-ref; shape check alone is not enough
                 aligned = aligner.align(ref, live_gray)
                 res     = inspector.inspect(ref, aligned)
                 if best_result is None or res.defect_score < best_result.defect_score:
@@ -351,12 +360,15 @@ def run_inspection(
                 inspector.set_reference(ref_grays[0])
                 temporal.reset()
                 if position_lock is not None:
-                    focused_tpl, tpl_offset = _focused_template(
-                        ref_grays[0], ref_templates[0]
-                    )
+                    focused_tpls = []
+                    tpl_offsets  = []
+                    for rg, rt in zip(ref_grays, ref_templates):
+                        tpl, off = _focused_template(rg, rt)
+                        focused_tpls.append(tpl)
+                        tpl_offsets.append(off)
                     position_lock.update_template(
-                        focused_tpl,
-                        roi_offset    = tpl_offset,
+                        focused_tpls,
+                        roi_offsets   = tpl_offsets,
                         full_roi_size = (roi[2], roi[3]),
                     )
                 print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
@@ -444,16 +456,20 @@ def main() -> None:
     # ---- Step 3: Position lock -----------------------------------------
     position_lock: PositionLock | None = None
     if POSITION_LOCK_ENABLED:
-        focused_tpl, tpl_offset = _focused_template(ref_grays[0], ref_templates[0])
+        focused_tpls = []
+        tpl_offsets  = []
+        for rg, rt in zip(ref_grays, ref_templates):
+            tpl, off = _focused_template(rg, rt)
+            focused_tpls.append(tpl)
+            tpl_offsets.append(off)
         position_lock = PositionLock(
-            focused_tpl,
-            roi_offset    = tpl_offset,
+            focused_tpls,
+            roi_offsets   = tpl_offsets,
             full_roi_size = (roi[2], roi[3]),
         )
         print(
-            f"[INFO] Position lock ON — "
-            f"template {focused_tpl.shape[1]}x{focused_tpl.shape[0]} px "
-            f"offset={tpl_offset}"
+            f"[INFO] Position lock ON — {len(focused_tpls)} template(s), "
+            f"sizes {[f'{t.shape[1]}x{t.shape[0]}' for t in focused_tpls]}"
         )
     else:
         print("[INFO] Position lock OFF — fixed ROI mode")

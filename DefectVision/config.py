@@ -45,7 +45,7 @@ ALIGN_MAX_ROTATION_DEG = 10.0  # Reject ECC result if estimated rotation > this
 
 # ECC (Enhanced Correlation Coefficient) parameters.
 # ECC handles translation + rotation; far more robust than phase correlation.
-ALIGN_ECC_MAX_ITER = 20        # Max iterations per frame (20 is sufficient for live-feed small movements)
+ALIGN_ECC_MAX_ITER = 10        # Max iterations per frame (10 is sufficient when position lock pre-aligns)
 ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 
 # ---- Text binarisation (inspector) --------------------------
@@ -93,6 +93,13 @@ DEFECT_SCORE_THRESHOLD = 0.20  # 0 = no defect, 1 = worst; tuned for binary-mask
 # stop as soon as one scores below this value — the print is clearly clean.
 # Saves 5-6 ECC alignment calls on the common (clean-print) path.
 INSPECT_EARLY_EXIT_SCORE = 0.05
+
+# Single-reference fast path: when position lock confidence exceeds this,
+# only inspect against the matching reference (skip all other angles).
+# The NCC template score is already a strong angle-identity signal; at 0.60+
+# it reliably identifies which captured angle is in the frame, so running
+# ECC + inspect against all other angles just wastes CPU.
+POSITION_LOCK_SINGLE_REF_CONF = 0.60
 
 # ---- Multi-reference video calibration ----------------------
 # Record a short video of a clean print at different angles; the system

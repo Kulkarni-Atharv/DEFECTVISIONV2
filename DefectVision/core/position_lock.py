@@ -8,6 +8,25 @@ from config import (
 )
 
 
+def _norm_offsets(
+    offsets: tuple[int, int] | list,
+    n: int,
+) -> list[tuple[int, int]]:
+    """Normalise roi_offsets to a list of length n.
+
+    A single (x, y) tuple is broadcast; a list is used as-is (must be length n).
+    """
+    if isinstance(offsets, tuple) and (not offsets or not isinstance(offsets[0], tuple)):
+        return [offsets] * n
+    result = list(offsets)
+    if len(result) != n:
+        raise ValueError(
+            f"roi_offsets length {len(result)} does not match "
+            f"number of templates {n}"
+        )
+    return result
+
+
 class PositionLock:
     """
     Locates the print region in each frame via normalised cross-correlation
@@ -43,7 +62,7 @@ class PositionLock:
     def __init__(
         self,
         templates: np.ndarray | list,
-        roi_offset: tuple[int, int] = (0, 0),
+        roi_offsets: tuple[int, int] | list = (0, 0),
         full_roi_size: tuple[int, int] | None = None,
     ) -> None:
         if isinstance(templates, np.ndarray):
@@ -55,10 +74,12 @@ class PositionLock:
         self._blur_thr:  float = POSITION_LOCK_BLUR_THRESHOLD
         self._last_pos: tuple[int, int] | None = None
 
-        # Offset of focused template top-left within the full drawn ROI.
-        # (0, 0) means the template IS the full ROI (no adjustment needed).
-        self._roi_offset:    tuple[int, int]         = roi_offset
-        self._full_roi_size: tuple[int, int] | None  = full_roi_size
+        # Per-template offsets: top-left of focused template within the full ROI.
+        # Pass a single (x, y) to broadcast to all templates, or a list for
+        # per-angle offsets (required when each angle has text at a different
+        # position inside the ROI).
+        self._roi_offsets:   list[tuple[int, int]]  = _norm_offsets(roi_offsets, len(self._templates))
+        self._full_roi_size: tuple[int, int] | None = full_roi_size
 
     # ------------------------------------------------------------------
     # Public API
@@ -67,7 +88,7 @@ class PositionLock:
     def update_template(
         self,
         templates: np.ndarray | list,
-        roi_offset: tuple[int, int] = (0, 0),
+        roi_offsets: tuple[int, int] | list = (0, 0),
         full_roi_size: tuple[int, int] | None = None,
     ) -> None:
         """Replace the templates (called on reference recapture)."""
@@ -75,7 +96,7 @@ class PositionLock:
             templates = [templates]
         self._templates     = list(templates)
         self._th, self._tw  = self._templates[0].shape[:2]
-        self._roi_offset    = roi_offset
+        self._roi_offsets   = _norm_offsets(roi_offsets, len(self._templates))
         self._full_roi_size = full_roi_size
         self._last_pos      = None
 
@@ -166,7 +187,10 @@ class PositionLock:
         self._last_pos = (mx, my)
 
         # --- expand back to full ROI coordinates -------------------------
-        ox_roi, oy_roi = self._roi_offset
+        # Use the offset for the specific template that won the match so that
+        # each captured angle (which may have text at a different position
+        # within the ROI) maps back to the correct full-ROI position.
+        ox_roi, oy_roi = self._roi_offsets[best_idx]
         if (ox_roi, oy_roi) != (0, 0) and self._full_roi_size is not None:
             full_w, full_h = self._full_roi_size
             rx = max(0, mx - ox_roi)
