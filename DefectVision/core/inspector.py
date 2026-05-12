@@ -3,9 +3,9 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 from config import (
-    ADAPTIVE_BLOCK_SIZE,
-    ADAPTIVE_C,
+    TEXT_BH_SIZE,
     TEXT_MIN_COMPONENT_AREA,
+    TEXT_TOLERANCE_PX,
     RECALL_WEIGHT,
     PURITY_WEIGHT,
     NCC_WEIGHT,
@@ -16,17 +16,17 @@ from config import (
 @dataclass
 class InspectionResult:
     # ---- Scalar scores (kept compatible with visualiser) ----------------
-    # ssim_score  → NCC structural similarity   (1 = identical, 0 = different)
-    # edge_diff_score → missing-text ratio      (0 = nothing missing)
-    # pixel_diff_score → extra-ink ratio        (0 = no extra ink)
+    # ssim_score       → NCC structural similarity  (1 = identical)
+    # edge_diff_score  → missing-text ratio          (0 = nothing missing)
+    # pixel_diff_score → extra-ink ratio             (0 = no extra ink)
     ssim_score: float = 1.0
     edge_diff_score: float = 0.0
     pixel_diff_score: float = 0.0
     defect_score: float = 0.0
     is_defect: bool = False
 
-    # ---- Per-pixel maps -------------------------------------------------
-    ssim_map: np.ndarray | None = None       # float64 [0,1]: 1=OK 0=defect (for heatmap)
+    # ---- Per-pixel maps (visualiser compatible) -------------------------
+    ssim_map: np.ndarray | None = None       # float64 [0,1]: 1=OK 0=defect
     diff_map: np.ndarray | None = None       # uint8: missing | extra pixels
     edge_diff_map: np.ndarray | None = None  # uint8: missing-ink binary map
 
@@ -35,10 +35,14 @@ class InspectionResult:
     defect_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
-# Morphology kernels
-_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-_OPEN_KERNEL  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-_DILATE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+# Morphology kernels (module-level — created once)
+_CLOSE_KERNEL   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_OPEN_KERNEL    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+_DILATE_KERNEL  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_TOL_KERNEL     = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (TEXT_TOLERANCE_PX * 2 + 1, TEXT_TOLERANCE_PX * 2 + 1),
+)
 _MIN_CONTOUR_AREA = 15
 
 
@@ -46,41 +50,47 @@ class Inspector:
     """
     Text-structure inspection engine.
 
-    Instead of comparing raw pixel intensities (SSIM / pixel-diff / edge-diff),
-    this engine compares the *binary ink structure* of the text:
+    Binarisation strategy
+    ─────────────────────
+    Instead of an adaptive mean threshold (sensitive to absolute brightness),
+    the engine uses a morphological blackhat (or tophat) transform:
 
-      1. Both reference and live are adaptively thresholded into binary
-         ink masks — completely immune to illumination differences.
+        blackhat = morph_close(gray) − gray
 
-      2. Three targeted signals are computed on those masks:
+    This extracts dark-ink features by measuring how much darker each pixel
+    is than its local neighbourhood.  The result is *independent of absolute
+    brightness* — the same ink on a dark-red background and on a white
+    background produces the same blackhat response.
 
-         Recall  — fraction of reference ink pixels present in the live frame.
-                   Catches missing characters, faded ink, broken strokes.
+    Polarity (dark text vs light text) is detected *once* from the reference
+    image and locked in for all subsequent live frames.
 
-         Purity  — inverse fraction of extra ink in live relative to reference.
-                   Catches smears, debris, added characters, bleed.
+    Comparison strategy
+    ───────────────────
+    Before computing missing / extra pixels, both binary masks are dilated
+    by TEXT_TOLERANCE_PX.  Sub-pixel stroke-boundary differences caused by
+    slight lighting or threshold variation are absorbed, while genuine defects
+    (missing characters, smears, debris) still cross the tolerance boundary
+    and are detected.
 
-         NCC     — normalised cross-correlation of the two binary masks.
-                   Catches structural distortion even when pixel counts match.
-
-      3. Composite defect score:
-            score = RECALL_W × (1−recall) + PURITY_W × (1−purity) + NCC_W × (1−ncc)
-
-    Because comparison operates on ink masks, ROI background, bottle surface,
-    roller movement, and illumination variation are completely invisible to
-    the algorithm.
+    Three signals → composite defect score:
+        Recall  – fraction of reference ink present in live  (missing chars)
+        Purity  – inverse fraction of extra ink in live       (smear / debris)
+        NCC     – normalised cross-correlation of masks        (shape distortion)
     """
 
     def __init__(self) -> None:
-        self._ref_bin: np.ndarray | None = None   # cleaned binary reference mask
-        self._ref_area: int = 0                    # number of ink pixels in reference
+        self._ref_bin:  np.ndarray | None = None
+        self._ref_area: int = 0
+        self._polarity: str = 'dark'   # 'dark' | 'light' — set on first reference
 
     # ------------------------------------------------------------------
     # Reference setup
     # ------------------------------------------------------------------
     def set_reference(self, ref_gray: np.ndarray) -> None:
-        """Binarise and cache the reference ink mask."""
-        self._ref_bin  = self._binarize(ref_gray)
+        """Detect polarity, binarise, and cache the reference ink mask."""
+        self._polarity = self._detect_polarity(ref_gray)
+        self._ref_bin  = self._binarize(ref_gray, self._polarity)
         self._ref_area = max(int(np.count_nonzero(self._ref_bin)), 1)
 
     # ------------------------------------------------------------------
@@ -92,26 +102,30 @@ class Inspector:
         if reference.shape != live.shape:
             live = cv2.resize(live, (reference.shape[1], reference.shape[0]))
 
-        # Recompute reference bin if not yet set (safety guard)
         if self._ref_bin is None or self._ref_bin.shape != reference.shape:
             self.set_reference(reference)
 
         ref_bin  = self._ref_bin
         ref_area = self._ref_area
 
-        # ---- Binarise live frame ----------------------------------------
-        live_bin = self._binarize(live)
+        # Binarise live with the SAME polarity as reference so that a
+        # lighting-induced polarity flip cannot produce a false defect.
+        live_bin = self._binarize(live, self._polarity)
+
+        # ---- Tolerance dilation -----------------------------------------
+        # Expand each mask by TEXT_TOLERANCE_PX before comparing so that
+        # stroke-boundary pixels shifted by lighting / threshold variation
+        # are absorbed without hiding real (larger) defects.
+        ref_tol  = cv2.dilate(ref_bin,  _TOL_KERNEL)
+        live_tol = cv2.dilate(live_bin, _TOL_KERNEL)
 
         # ---- Signal 1: Recall — missing ink -----------------------------
-        # Pixels that are ink in reference but not in live.
-        missing = cv2.bitwise_and(ref_bin, cv2.bitwise_not(live_bin))
+        missing = cv2.bitwise_and(ref_bin, cv2.bitwise_not(live_tol))
         recall  = 1.0 - float(np.count_nonzero(missing)) / ref_area
 
-        # ---- Signal 2: Purity — extra ink -------------------------------
-        # Pixels that are ink in live but not in reference (normalised by
-        # ref_area so the score is relative to expected ink volume).
-        extra   = cv2.bitwise_and(live_bin, cv2.bitwise_not(ref_bin))
-        purity  = 1.0 - float(np.count_nonzero(extra)) / ref_area
+        # ---- Signal 2: Purity — extra ink --------------------------------
+        extra  = cv2.bitwise_and(live_bin, cv2.bitwise_not(ref_tol))
+        purity = 1.0 - float(np.count_nonzero(extra)) / ref_area
 
         # ---- Signal 3: NCC — structural shape ---------------------------
         ref_f  = ref_bin.astype(np.float64)
@@ -119,8 +133,7 @@ class Inspector:
         ref_m  = ref_f  - ref_f.mean()
         live_m = live_f - live_f.mean()
         denom  = np.sqrt(np.sum(ref_m ** 2) * np.sum(live_m ** 2))
-        ncc    = float(np.sum(ref_m * live_m) / (denom + 1e-8))
-        ncc    = float(np.clip(ncc, 0.0, 1.0))
+        ncc    = float(np.clip(np.sum(ref_m * live_m) / (denom + 1e-8), 0.0, 1.0))
 
         # ---- Composite score --------------------------------------------
         defect_score = (
@@ -128,22 +141,20 @@ class Inspector:
             PURITY_WEIGHT * float(np.clip(1.0 - purity, 0.0, 1.0)) +
             NCC_WEIGHT    * (1.0 - ncc)
         )
-        result.defect_score    = float(np.clip(defect_score, 0.0, 1.0))
-        result.is_defect       = result.defect_score >= DEFECT_SCORE_THRESHOLD
+        result.defect_score  = float(np.clip(defect_score, 0.0, 1.0))
+        result.is_defect     = result.defect_score >= DEFECT_SCORE_THRESHOLD
 
         # ---- Map to legacy fields (visualiser compatibility) ------------
-        result.ssim_score        = ncc              # structure similarity
-        result.edge_diff_score   = 1.0 - recall     # missing-text ratio
-        result.pixel_diff_score  = float(np.clip(1.0 - purity, 0.0, 1.0))  # extra-ink ratio
+        result.ssim_score       = ncc
+        result.edge_diff_score  = 1.0 - recall
+        result.pixel_diff_score = float(np.clip(1.0 - purity, 0.0, 1.0))
+        result.diff_map         = cv2.add(missing, extra)
+        result.edge_diff_map    = missing
 
-        # diff_map: union of missing and extra pixels → pixel-diff panel
-        result.diff_map      = cv2.add(missing, extra)
-        result.edge_diff_map = missing
-
-        # ssim_map: float [0,1] used by heatmap renderer (1=OK, 0=defect)
+        # ssim_map: float [0,1] — 1=OK, 0=defect — drives heatmap renderer
         synth = np.ones(reference.shape, dtype=np.float64)
-        synth[missing > 0] = 0.0   # missing ink → hot (most severe)
-        synth[extra   > 0] = 0.35  # extra ink   → warm
+        synth[missing > 0] = 0.0    # missing ink → hot (most severe)
+        synth[extra   > 0] = 0.35   # extra ink   → warm
         result.ssim_map = synth
 
         # ---- Defect localisation ----------------------------------------
@@ -160,46 +171,45 @@ class Inspector:
         return result
 
     # ------------------------------------------------------------------
-    # Binarisation
+    # Binarisation helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _binarize(gray: np.ndarray) -> np.ndarray:
+    def _detect_polarity(gray: np.ndarray) -> str:
         """
-        Convert preprocessed gray image to a clean binary ink mask.
-
-        Steps:
-          1. Adaptive mean threshold — each local tile uses its own mean,
-             so uneven illumination across the ROI has no effect.
-          2. Auto-detect polarity — dark text on light bg or vice versa.
-          3. Morphological cleanup — connect broken strokes, remove noise.
-          4. Small-component filter — discard isolated noise dots.
+        Return 'dark' if text is dark-on-bright, 'light' if text is
+        light-on-dark.  Compares the mean response of blackhat vs tophat —
+        whichever is stronger indicates the correct ink polarity.
         """
-        h, w = gray.shape
+        kernel = Inspector._bh_kernel(gray)
+        bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,   kernel)
+        return 'dark' if float(bh.mean()) >= float(th.mean()) else 'light'
 
-        # Block size must be odd and ≤ min image dimension
-        block = ADAPTIVE_BLOCK_SIZE
-        block = min(block, h, w)
-        if block % 2 == 0:
-            block -= 1
-        block = max(block, 3)
+    @staticmethod
+    def _binarize(gray: np.ndarray, polarity: str = 'dark') -> np.ndarray:
+        """
+        Convert preprocessed gray to a clean binary ink mask (white = ink).
 
-        # THRESH_BINARY_INV: dark pixels (ink on bright bg) → white
-        bin_mask = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV,
-            block, ADAPTIVE_C,
-        )
+        Uses morphological blackhat (dark text) or tophat (light text) to
+        measure local ink contrast independently of absolute brightness.
+        Otsu thresholds the result, so the same ink on any background
+        produces a consistent binary mask.
+        """
+        kernel = Inspector._bh_kernel(gray)
 
-        # Polarity guard: text is the minority; if >50% is white, invert
-        if np.count_nonzero(bin_mask) > gray.size * 0.5:
-            bin_mask = cv2.bitwise_not(bin_mask)
+        if polarity == 'dark':
+            features = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        else:
+            features = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
 
-        # Connect broken strokes and remove single-pixel noise
+        # Otsu on the local-contrast image — consistent regardless of scene brightness
+        _, bin_mask = cv2.threshold(features, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Connect broken strokes; remove single-pixel noise
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, _CLOSE_KERNEL)
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN,  _OPEN_KERNEL)
 
-        # Remove tiny components (sensor noise, CLAHE artefacts)
+        # Drop tiny components (sensor noise, CLAHE artefacts)
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
         cleaned = np.zeros_like(bin_mask)
         for i in range(1, n_labels):
@@ -207,3 +217,15 @@ class Inspector:
                 cleaned[labels == i] = 255
 
         return cleaned
+
+    @staticmethod
+    def _bh_kernel(gray: np.ndarray) -> np.ndarray:
+        """
+        Return a square structuring element sized for this ROI.
+        Capped at ROI_min_dimension / 3 so it never spans the whole image.
+        """
+        size = min(TEXT_BH_SIZE, min(gray.shape) // 3)
+        size = max(size, 3)
+        if size % 2 == 0:
+            size += 1
+        return cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))

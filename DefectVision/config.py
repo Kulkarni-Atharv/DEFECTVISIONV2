@@ -49,10 +49,21 @@ ALIGN_ECC_MAX_ITER = 50        # Max iterations per frame
 ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 
 # ---- Text binarisation (inspector) --------------------------
-# Adaptive mean threshold: each (BLOCK × BLOCK) tile uses its own mean.
-ADAPTIVE_BLOCK_SIZE     = 31   # Must be odd; reduce for tiny text
-ADAPTIVE_C              = 8    # Constant subtracted from local mean
+# Blackhat morphology isolates dark ink by local contrast, independent of
+# absolute brightness.  Kernel should be larger than one stroke width but
+# smaller than the gap between characters.
+TEXT_BH_SIZE            = 21   # Blackhat/tophat kernel size (px); increase for large text
 TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real text
+
+# Tolerance dilation: before comparing missing/extra, both masks are dilated
+# by this many pixels so that sub-pixel stroke-boundary differences (caused
+# by slight lighting or threshold variation) are absorbed without hiding real
+# defects like missing characters or large smears.
+TEXT_TOLERANCE_PX       = 3
+
+# Legacy adaptive-threshold params (no longer used; kept for reference)
+ADAPTIVE_BLOCK_SIZE     = 31
+ADAPTIVE_C              = 8
 
 # ---- Text-structure comparison weights ----------------------
 # Defect score = RECALL_W*(1−recall) + PURITY_W*(1−purity) + NCC_W*(1−ncc)

@@ -63,14 +63,18 @@ class Preprocessor:
         return gray
 
     def _normalise_background(self, gray: np.ndarray) -> np.ndarray:
-        # Clamp kernel to image size (small ROIs)
         h, w = gray.shape
-        kh = min(self._bg_ksize[0], h | 1)   # keep odd
-        kw = min(self._bg_ksize[1], w | 1)
-        kh = kh if kh % 2 == 1 else kh - 1
-        kw = kw if kw % 2 == 1 else kw - 1
-        kh, kw = max(kh, 3), max(kw, 3)
 
-        bg = cv2.GaussianBlur(gray, (kw, kh), self._bg_sigma)
-        # scale * src1 / src2 — uint8 result is automatically clipped to [0,255]
+        # Cap sigma so the kernel never exceeds ROI_dimension / 4.
+        # A larger kernel would span the whole ROI, include text pixels in
+        # the background estimate, and produce a wrong divide result.
+        sigma = min(self._bg_sigma, min(h, w) / 4.0)
+        if sigma < 2.0:
+            return gray  # ROI too small — skip normalisation
+
+        ksize = int(6 * sigma) | 1   # next odd integer ≥ 6σ
+        ksize = max(ksize, 3)
+
+        bg = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
+        # scale * src1 / src2 — uint8 output is auto-clipped to [0, 255]
         return cv2.divide(gray, bg, scale=128.0)
