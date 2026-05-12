@@ -5,9 +5,14 @@ Entry point.  Run with:
     python main.py
     python main.py --roi 100 50 400 200   # skip GUI ROI selector
 
-Key bindings (during inspection):
+Key bindings during reference capture:
+    SPACE  — capture this angle (averages several frames)
+    D      — delete last captured angle
+    Q      — confirm and start inspection
+
+Key bindings during inspection:
     Q      — quit
-    R      — recapture reference (place clean sample first)
+    R      — recapture references (place clean sample first)
     S      — save snapshot of current live ROI to logs/
     SPACE  — pause / resume
 """
@@ -26,7 +31,6 @@ from config import (
     REFERENCE_FRAME_COUNT, REFERENCE_WARMUP_FRAMES,
     LOG_DIR,
     POSITION_LOCK_ENABLED,
-    MAX_REFERENCES, REF_MIN_DISTINCTNESS,
     INSPECT_EARLY_EXIT_SCORE,
 )
 from core.camera          import create_camera
@@ -48,216 +52,112 @@ def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
     return frame[y: y + h, x: x + w].copy()
 
 
-# ====================================================================
-# Multi-reference helpers
-# ====================================================================
-
-def _frame_ncc(a: np.ndarray, b: np.ndarray) -> float:
-    """Normalised cross-correlation between two same-shape grayscale images."""
-    af = a.astype(np.float64)
-    bf = b.astype(np.float64)
-    am = af - af.mean()
-    bm = bf - bf.mean()
-    denom = np.sqrt(np.sum(am ** 2) * np.sum(bm ** 2))
-    return float(np.clip(np.sum(am * bm) / (denom + 1e-8), 0.0, 1.0))
-
-
-def _select_diverse_bgr_frames(
-    bgr_frames: list,
-    max_refs: int,
-    min_distinctness: float,
-    preprocessor: Preprocessor,
-) -> list:
+def _focused_template(
+    ref_gray: np.ndarray,
+    ref_template: np.ndarray,
+    min_fraction: float = 0.03,
+    margin: int = 10,
+) -> tuple[np.ndarray, tuple[int, int]]:
     """
-    Walk through bgr_frames and keep up to max_refs frames whose TEXT
-    appearance is structurally distinct (pairwise NCC on text crops below
-    min_distinctness).
+    Shrink the position-lock template to the text bounding box so the
+    NCC search matches on distinctive ink rather than featureless background.
 
-    Using text crops — not a full-frame downsample — ensures that frames
-    where the print is at different angles are treated as distinct even when
-    the bottle surface dominates the full-frame signal.  Falls back to
-    uniform temporal sampling if no text is detected.
-    """
-    if not bgr_frames:
-        return []
-
-    n    = len(bgr_frames)
-    # Sample at most 60 candidates to bound preprocessing cost
-    step = max(1, n // 60)
-    candidates = list(range(0, n, step))
-
-    # Extract text crop from each candidate frame
-    crops: dict[int, np.ndarray] = {}
-    for idx in candidates:
-        cg, _ = _auto_text_crop(bgr_frames[idx], preprocessor, target_hw=None, margin=20)
-        if cg is not None:
-            crops[idx] = cg.astype(np.float64)
-
-    if not crops:
-        # No text detected in any sampled frame — fall back to uniform sampling
-        uniform_step = max(1, n // max_refs)
-        return [bgr_frames[i] for i in range(0, n, uniform_step)][:max_refs]
-
-    valid = list(crops.keys())
-    h0, w0 = crops[valid[0]].shape[:2]
-
-    def normed(idx: int) -> np.ndarray:
-        c = crops[idx]
-        if c.shape[:2] != (h0, w0):
-            c = cv2.resize(c, (w0, h0)).astype(np.float64)
-        return c
-
-    sel_idx   = [valid[0]]
-    sel_crops = [normed(valid[0])]
-
-    for idx in valid[1:]:
-        if len(sel_idx) >= max_refs:
-            break
-        c = normed(idx)
-        if all(_frame_ncc(c, r) < min_distinctness for r in sel_crops):
-            sel_idx.append(idx)
-            sel_crops.append(c)
-
-    return [bgr_frames[i] for i in sel_idx]
-
-
-def _auto_text_crop(
-    frame_bgr: np.ndarray,
-    preprocessor: Preprocessor,
-    target_hw: tuple[int, int] | None = None,
-    margin: int = 25,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """
-    Detect the text bounding box in *frame_bgr* using the Inspector's
-    binarisation and return (processed_gray_crop, raw_gray_crop), both
-    resized to *target_hw* (h, w) if given.
-
-    Returns (None, None) if no text is found.
+    Returns (focused_crop, (offset_x, offset_y)) where offset is the
+    top-left of the crop within the ROI.  Falls back to the full template
+    when text cannot be isolated.
     """
     try:
-        gray = preprocessor.process(frame_bgr)
-        polarity = Inspector._detect_polarity(gray)
-        bin_mask = Inspector._binarize(gray, polarity)
+        polarity = Inspector._detect_polarity(ref_gray)
+        bin_mask = Inspector._binarize(ref_gray, polarity)
         pts = cv2.findNonZero(bin_mask)
         if pts is None:
-            return None, None
+            return ref_template, (0, 0)
         tx, ty, tw, th = cv2.boundingRect(pts)
-        h_img, w_img = gray.shape
+        if tw * th < bin_mask.size * min_fraction:
+            return ref_template, (0, 0)
+        h_img, w_img = ref_template.shape[:2]
         x1 = max(0, tx - margin)
         y1 = max(0, ty - margin)
         x2 = min(w_img, tx + tw + margin)
         y2 = min(h_img, ty + th + margin)
-        if x2 <= x1 or y2 <= y1:
-            return None, None
-        crop_gray = gray[y1:y2, x1:x2]
-        raw_gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)[y1:y2, x1:x2]
-        if target_hw is not None:
-            th_t, tw_t = target_hw
-            crop_gray = cv2.resize(crop_gray, (tw_t, th_t))
-            raw_gray  = cv2.resize(raw_gray,  (tw_t, th_t))
-        return crop_gray, raw_gray
+        crop = ref_template[y1:y2, x1:x2]
+        if crop.size == 0:
+            return ref_template, (0, 0)
+        return crop, (x1, y1)
     except Exception:
-        return None, None
+        return ref_template, (0, 0)
 
 
 # ====================================================================
-# Reference capture (single averaged frame — kept for internal use)
+# Reference capture — manual multi-angle
 # ====================================================================
 
-def capture_reference(
+def capture_reference_multi(
     cap,
     roi: tuple[int, int, int, int],
     preprocessor: Preprocessor,
     n: int = REFERENCE_FRAME_COUNT,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Average N frames to build a stable reference.
-
-    Returns
-    -------
-    (ref_gray, ref_template)
-      ref_gray     — CLAHE-processed uint8, used by Inspector for comparison.
-      ref_template — raw grayscale uint8, used by PositionLock for template matching.
-    """
-    acc_processed: np.ndarray | None = None
-    acc_raw:       np.ndarray | None = None
-    collected = 0
-
-    while collected < n:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        crop = _grab_roi(frame, roi)
-        processed = preprocessor.process(crop)
-        raw_gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        if acc_processed is None:
-            acc_processed = np.float64(processed)
-            acc_raw       = np.float64(raw_gray)
-        else:
-            acc_processed += processed
-            acc_raw       += raw_gray
-        collected += 1
-        time.sleep(1.0 / CAMERA_FPS)
-
-    return np.uint8(acc_processed / n), np.uint8(acc_raw / n)
-
-
-# ====================================================================
-# Reference capture UI — full-frame video-based multi-angle calibration
-# ====================================================================
-
-def capture_reference_video(
-    cap,
-    preprocessor: Preprocessor,
 ) -> tuple[list, list] | None:
     """
-    Record a short video of a clean print at different angles.
-    Recording uses the FULL FRAME — no ROI constraint — so the user can
-    tilt and rotate freely without the print leaving the crop area.
+    Manually capture reference images at multiple angles.
 
-    After stopping, diverse frames are extracted automatically and the
-    text bounding box is detected from each frame.  All crops are
-    normalised to the same size so Inspector and PositionLock can use
-    them interchangeably.
+    Position the clean print at each desired orientation, then press
+    SPACE to capture that angle (averages n frames for stability).
+    Repeat for every orientation expected during inspection, then
+    press Q to confirm.
 
     Controls
     --------
-    SPACE  — start recording (overlay turns red) / stop recording
-    Q      — confirm current references and proceed (or abort if none)
+    SPACE  — capture current angle  (shows live ROI crop while waiting)
+    D      — delete the last captured angle
+    Q      — confirm and proceed (returns None if nothing was captured)
 
     Returns
     -------
     (ref_grays, ref_templates)
-      ref_grays     — list of preprocessed uint8 gray text crops (Inspector)
-      ref_templates — list of raw grayscale uint8 text crops (PositionLock)
-    Returns None if the user quits without capturing any references.
+      ref_grays     — list of preprocessed uint8 ROI crops  (Inspector)
+      ref_templates — list of raw grayscale uint8 ROI crops (PositionLock)
     """
-    WIN = "DefectVision — Reference Video  [SPACE=start/stop  Q=confirm]"
+    WIN = "DefectVision — Reference Capture  [SPACE=capture  D=undo  Q=confirm]"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    x, y, w, h = roi
 
-    recording:      bool  = False
-    raw_bgr_frames: list  = []
-    ref_grays:      list  = []
-    ref_templates:  list  = []
+    ref_grays:    list = []
+    ref_templates: list = []
+    capturing          = False
+    buf_proc:     list = []
+    buf_raw:      list = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
             continue
 
-        if recording:
-            raw_bgr_frames.append(frame.copy())
+        crop     = _grab_roi(frame, roi)
+        gray_raw = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        if capturing:
+            buf_proc.append(preprocessor.process(crop))
+            buf_raw.append(gray_raw)
+            if len(buf_proc) >= n:
+                ref_grays.append(np.uint8(np.mean(buf_proc, axis=0)))
+                ref_templates.append(np.uint8(np.mean(buf_raw, axis=0)))
+                buf_proc.clear()
+                buf_raw.clear()
+                capturing = False
+                print(f"[INFO] Angle {len(ref_grays)} captured.")
 
         display = frame.copy()
-        color   = (0, 0, 220) if recording else (0, 220, 255)
+        color   = (0, 0, 220) if capturing else (0, 220, 255)
+        cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
 
-        if recording:
-            label = f"RECORDING  {len(raw_bgr_frames)} frames  |  SPACE = stop"
+        if capturing:
+            label = f"Capturing {len(buf_proc)}/{n} ..."
         elif ref_grays:
             label = (f"{len(ref_grays)} angle(s) ready  |  "
-                     f"Q = confirm  |  SPACE = re-record")
+                     f"SPACE=next angle  D=undo  Q=confirm")
         else:
-            label = "Tilt print through all expected angles  |  SPACE = start"
+            label = "Position print at angle 1, then press SPACE"
 
         cv2.putText(display, label, (10, 34),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
@@ -265,49 +165,18 @@ def capture_reference_video(
 
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord(' '):
-            if not recording:
-                recording = True
-                raw_bgr_frames.clear()
-                print("[INFO] Recording started — tilt the print through all expected orientations …")
-            else:
-                recording = False
-                print(f"[INFO] Stopped.  Selecting references from {len(raw_bgr_frames)} frames …")
+        if key == ord(' ') and not capturing:
+            capturing = True
+            buf_proc.clear()
+            buf_raw.clear()
+            print(f"[INFO] Capturing angle {len(ref_grays) + 1} ({n} frames) ...")
 
-                diverse_bgr = _select_diverse_bgr_frames(
-                    raw_bgr_frames, MAX_REFERENCES, REF_MIN_DISTINCTNESS, preprocessor,
-                )
-                # Release the large recording buffer immediately — 1000 frames
-                # at full resolution can exceed 4 GB; keeping them in memory
-                # while inspection runs causes lag from memory pressure.
-                raw_bgr_frames.clear()
+        elif key == ord('d') and ref_grays and not capturing:
+            ref_grays.pop()
+            ref_templates.pop()
+            print(f"[INFO] Last angle removed.  {len(ref_grays)} angle(s) remaining.")
 
-                ref_grays.clear()
-                ref_templates.clear()
-                target_hw: tuple[int, int] | None = None
-
-                for bgr in diverse_bgr:
-                    cg, cr = _auto_text_crop(bgr, preprocessor, target_hw)
-                    if cg is not None:
-                        if target_hw is None:
-                            target_hw = (cg.shape[0], cg.shape[1])
-                        ref_grays.append(cg)
-                        ref_templates.append(cr)
-
-                diverse_bgr.clear()  # done with the 7 full-frame BGR crops too
-
-                if ref_grays:
-                    print(
-                        f"[INFO] {len(ref_grays)} distinct reference angle(s) selected.  "
-                        f"Crop size: {ref_grays[0].shape[1]}×{ref_grays[0].shape[0]} px"
-                    )
-                else:
-                    print(
-                        "[WARN] No text detected in recorded frames.  "
-                        "Ensure the print is clearly visible and try again."
-                    )
-
-        elif key == ord('q'):
+        elif key == ord('q') and not capturing:
             cv2.destroyWindow(WIN)
             return (ref_grays, ref_templates) if ref_grays else None
 
@@ -349,11 +218,9 @@ def run_inspection(
     smoothed_score   = 0.0
     confirmed_defect = False
     match_conf       = 0.0
-    current_roi      = roi     # updated each frame when position lock is active
+    current_roi      = roi
     paused           = False
-
-    # Pre-compute search bounds (user's drawn ROI in frame coordinates)
-    sx, sy, sw, sh = roi
+    best_tpl_idx     = 0
 
     print("[INFO] Inspection running.  Q=quit  R=new reference  S=snapshot  SPACE=pause")
 
@@ -365,19 +232,18 @@ def run_inspection(
 
             frame_num   += 1
             fps_counter += 1
-
             if fps_counter >= 30:
                 fps         = fps_counter / max(time.monotonic() - fps_t0, 1e-6)
                 fps_t0      = time.monotonic()
                 fps_counter = 0
 
-            # ---- Position lock: find print within the drawn ROI ------
+            # ---- Position lock: search the full frame ----------------
+            # The focused template is small (text only); searching the full
+            # frame is fast and the roi_offset math inside find() is correct
+            # only when the full frame is passed.
             if position_lock is not None:
                 frame_gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Constrain the search to the user's drawn ROI so that
-                # unrelated objects elsewhere in the frame are ignored.
-                search_region = frame_gray_full[sy:sy + sh, sx:sx + sw]
-                match = position_lock.find(search_region)
+                match = position_lock.find(frame_gray_full)
 
                 if match is None:
                     main_display = frame.copy()
@@ -397,11 +263,8 @@ def run_inspection(
                         paused = not paused
                     continue
 
-                # Convert ROI-relative coords to full-frame coords.
-                # best_tpl_idx is the template that won — put that reference
-                # first so the inspection loop checks the closest angle first.
-                (tx, ty, tw, th), match_conf, best_tpl_idx = match
-                current_roi = (sx + tx, sy + ty, tw, th)
+                # find() already applied roi_offset → current_roi is in frame coords
+                current_roi, match_conf, best_tpl_idx = match
             else:
                 current_roi  = roi
                 match_conf   = 1.0
@@ -411,23 +274,18 @@ def run_inspection(
             roi_bgr   = _grab_roi(frame, current_roi)
             live_gray = preprocessor.process(roi_bgr)
 
-            # Resize live to reference size if needed (e.g. no position lock)
             if live_gray.shape != ref_grays[0].shape:
                 live_gray = cv2.resize(
                     live_gray,
                     (ref_grays[0].shape[1], ref_grays[0].shape[0]),
                 )
 
-            # ---- Align live to each reference, keep best match -------
-            # Check the angle that position lock already identified as the
-            # closest match first.  If it scores clean, skip the rest —
-            # this cuts 5-6 ECC calls per frame on the common (clean) path.
-            if position_lock is not None:
-                ordered_indices = [best_tpl_idx] + [
-                    i for i in range(len(ref_grays)) if i != best_tpl_idx
-                ]
-            else:
-                ordered_indices = list(range(len(ref_grays)))
+            # ---- Align + inspect against all references --------------
+            # Check the angle identified by position lock first; exit early
+            # on the common clean-print path to save ECC calls.
+            ordered_indices = [best_tpl_idx] + [
+                i for i in range(len(ref_grays)) if i != best_tpl_idx
+            ]
 
             best_result = None
             best_ref    = ref_grays[0]
@@ -441,7 +299,7 @@ def run_inspection(
                     best_ref    = ref
                     best_live   = aligned
                 if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
-                    break  # clearly clean — no need to check remaining angles
+                    break
             result    = best_result
             live_gray = best_live
 
@@ -453,10 +311,9 @@ def run_inspection(
             if warming_up:
                 confirmed_defect = False
 
-            # ---- Log -------------------------------------------------
             logger.log(frame_num, result, confirmed_defect, smoothed_score, roi_bgr)
 
-            # ---- Main feed display -----------------------------------
+            # ---- Main feed -------------------------------------------
             main_display = frame.copy()
             main_display = visualizer.draw_main_overlay(
                 main_display, current_roi, confirmed_defect, smoothed_score,
@@ -467,7 +324,6 @@ def run_inspection(
                         (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
             cv2.imshow(WIN_MAIN, main_display)
 
-            # ---- Inspection panel ------------------------------------
             panel = visualizer.build_panel(
                 roi_bgr, best_ref, live_gray,
                 result, confirmed_defect, smoothed_score, fps, warming_up, match_conf,
@@ -488,14 +344,21 @@ def run_inspection(
             print(f"[INFO] {'Paused' if paused else 'Resumed'}")
 
         elif key == ord('r'):
-            print("[INFO] Recapturing references — record video of clean sample …")
-            cap_result = capture_reference_video(cap, preprocessor)
+            print("[INFO] Recapturing references — position clean sample in ROI ...")
+            cap_result = capture_reference_multi(cap, roi, preprocessor)
             if cap_result is not None:
                 ref_grays, ref_templates = cap_result
                 inspector.set_reference(ref_grays[0])
                 temporal.reset()
                 if position_lock is not None:
-                    position_lock.update_template(ref_templates)
+                    focused_tpl, tpl_offset = _focused_template(
+                        ref_grays[0], ref_templates[0]
+                    )
+                    position_lock.update_template(
+                        focused_tpl,
+                        roi_offset    = tpl_offset,
+                        full_roi_size = (roi[2], roi[3]),
+                    )
                 print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
             else:
                 print("[INFO] Reference recapture cancelled.")
@@ -519,12 +382,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DefectVision print defect inspection")
     parser.add_argument(
         "--roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
-        help="Skip GUI ROI selector; use fixed search area  e.g. --roi 100 50 400 200"
+        help="Skip GUI ROI selector  e.g. --roi 100 50 400 200"
     )
     args = parser.parse_args()
 
-    # ---- Camera ----------------------------------------------------
-    print(f"[INFO] Starting camera (backend={CAMERA_BACKEND}) …")
+    # ---- Camera --------------------------------------------------------
+    print(f"[INFO] Starting camera (backend={CAMERA_BACKEND}) ...")
     cam = create_camera(
         CAMERA_BACKEND,
         index    = CAMERA_INDEX,
@@ -538,10 +401,9 @@ def main() -> None:
         print("[ERROR] Could not open camera.  Check CAMERA_BACKEND / CAMERA_INDEX in config.py.")
         sys.exit(1)
 
-    w, h = cam.get_resolution()
-    print(f"[INFO] Camera ready: {w}×{h} @ {cam.get_fps():.0f} fps")
+    cw, ch = cam.get_resolution()
+    print(f"[INFO] Camera ready: {cw}x{ch} @ {cam.get_fps():.0f} fps")
 
-    # ---- Subsystem init --------------------------------------------
     preprocessor = Preprocessor()
     aligner      = Aligner()
     inspector    = Inspector()
@@ -549,39 +411,12 @@ def main() -> None:
     visualizer   = Visualizer()
     logger       = DefectLogger()
 
-    # ---- Step 1: Reference video — FULL FRAME, no ROI constraint ---
-    # User tilts/rotates the clean print freely; diverse angle frames
-    # are captured and auto-cropped to the text region.
-    print("[INFO] Step 1: Record reference video (tilt the print through all expected angles).")
-    ref_result = capture_reference_video(cam, preprocessor)
-    if ref_result is None:
-        print("[INFO] Reference capture cancelled.  Exiting.")
-        cam.release()
-        sys.exit(0)
-
-    ref_grays, ref_templates = ref_result
-    tpl_h, tpl_w = ref_grays[0].shape[:2]
-    print(
-        f"[INFO] {len(ref_grays)} reference angle(s) captured.  "
-        f"Shape: {ref_grays[0].shape}  dtype: {ref_grays[0].dtype}"
-    )
-    # Advise minimum ROI size so the user draws a box large enough for the
-    # templates.  Add 20 % headroom so the text can move slightly within it.
-    min_roi_w = int(tpl_w * 1.20)
-    min_roi_h = int(tpl_h * 1.20)
-    print(
-        f"[INFO] Recommended minimum search ROI: {min_roi_w} × {min_roi_h} px  "
-        f"(draw a box at least this size in the next step)"
-    )
-
-    # ---- Step 2: Draw search ROI -----------------------------------
-    # The ROI is the region of the frame where the print can appear.
-    # Position lock will track the text anywhere within this area.
-    print("[INFO] Step 2: Draw a generous ROI covering the area where the print can appear.")
+    # ---- Step 1: Draw the inspection ROI --------------------------------
     if args.roi:
         roi = tuple(args.roi)
         print(f"[INFO] ROI from CLI: x={roi[0]} y={roi[1]} w={roi[2]} h={roi[3]}")
     else:
+        print("[INFO] Step 1: Draw the inspection ROI on the live feed.")
         roi = ROISelector().select(cam)
         if roi is None:
             print("[INFO] ROI selection cancelled.  Exiting.")
@@ -589,30 +424,41 @@ def main() -> None:
             sys.exit(0)
 
     x, y, rw, rh = roi
-    print(f"[INFO] Search ROI: x={x} y={y} w={rw} h={rh}")
-    if rw < tpl_w or rh < tpl_h:
-        print(
-            f"[WARN] ROI ({rw}×{rh}) is smaller than the reference template "
-            f"({tpl_w}×{tpl_h}).  Position lock will use centre-cropped templates "
-            f"— tracking may be less reliable.  Consider re-drawing a larger ROI."
-        )
+    print(f"[INFO] ROI: x={x} y={y} w={rw} h={rh}")
 
-    # ---- Step 3: Position lock with all reference templates --------
+    # ---- Step 2: Capture references at each expected angle --------------
+    print("[INFO] Step 2: Capture reference at each expected angle.")
+    print("[INFO]   Position clean print in ROI → SPACE to capture → repeat → Q to confirm")
+    ref_result = capture_reference_multi(cam, roi, preprocessor)
+    if ref_result is None:
+        print("[INFO] Reference capture cancelled.  Exiting.")
+        cam.release()
+        sys.exit(0)
+
+    ref_grays, ref_templates = ref_result
+    print(
+        f"[INFO] {len(ref_grays)} reference angle(s) captured.  "
+        f"Shape: {ref_grays[0].shape}"
+    )
+
+    # ---- Step 3: Position lock -----------------------------------------
     position_lock: PositionLock | None = None
     if POSITION_LOCK_ENABLED:
+        focused_tpl, tpl_offset = _focused_template(ref_grays[0], ref_templates[0])
         position_lock = PositionLock(
-            ref_templates,      # list of raw-gray text crops, one per angle
-            roi_offset=(0, 0),  # templates are already tight text crops
-            full_roi_size=None, # return template-size bounding boxes
+            focused_tpl,
+            roi_offset    = tpl_offset,
+            full_roi_size = (roi[2], roi[3]),
         )
         print(
-            f"[INFO] Position lock ON — {len(ref_templates)} template(s)  "
-            f"size: {ref_templates[0].shape[1]}×{ref_templates[0].shape[0]} px"
+            f"[INFO] Position lock ON — "
+            f"template {focused_tpl.shape[1]}x{focused_tpl.shape[0]} px "
+            f"offset={tpl_offset}"
         )
     else:
         print("[INFO] Position lock OFF — fixed ROI mode")
 
-    # ---- Step 4: Inspection loop -----------------------------------
+    # ---- Step 4: Inspection loop ---------------------------------------
     try:
         run_inspection(
             cam, roi, ref_grays, ref_templates,
