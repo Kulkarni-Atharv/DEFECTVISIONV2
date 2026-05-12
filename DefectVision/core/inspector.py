@@ -202,7 +202,9 @@ class Inspector:
         else:
             features = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
 
-        # Otsu on the local-contrast image — consistent regardless of scene brightness
+        # Denoise before Otsu — suppresses CLAHE/background artefacts so the
+        # threshold falls cleanly between background (≈0) and ink (positive).
+        features = cv2.GaussianBlur(features, (3, 3), 0)
         _, bin_mask = cv2.threshold(features, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # Connect broken strokes; remove single-pixel noise

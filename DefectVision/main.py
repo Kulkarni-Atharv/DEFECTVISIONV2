@@ -46,6 +46,42 @@ def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
     return frame[y: y + h, x: x + w].copy()
 
 
+def _focused_template(
+    ref_gray: np.ndarray,
+    ref_template: np.ndarray,
+    min_fraction: float = 0.03,
+    margin: int = 10,
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """
+    Shrink the position-lock template to the text bounding box so that the
+    NCC search matches on distinctive ink rather than featureless background.
+
+    Returns (focused_crop, (offset_x, offset_y)) where offset is the
+    top-left corner of the crop within the full ROI.  Falls back to
+    (ref_template, (0, 0)) when text cannot be isolated.
+    """
+    try:
+        polarity = Inspector._detect_polarity(ref_gray)
+        bin_mask = Inspector._binarize(ref_gray, polarity)
+        pts = cv2.findNonZero(bin_mask)
+        if pts is None:
+            return ref_template, (0, 0)
+        tx, ty, tw, th = cv2.boundingRect(pts)
+        if tw * th < bin_mask.size * min_fraction:
+            return ref_template, (0, 0)
+        h_img, w_img = ref_template.shape[:2]
+        x1 = max(0, tx - margin)
+        y1 = max(0, ty - margin)
+        x2 = min(w_img, tx + tw + margin)
+        y2 = min(h_img, ty + th + margin)
+        crop = ref_template[y1:y2, x1:x2]
+        if crop.size == 0:
+            return ref_template, (0, 0)
+        return crop, (x1, y1)
+    except Exception:
+        return ref_template, (0, 0)
+
+
 # ====================================================================
 # Reference capture
 # ====================================================================
@@ -275,8 +311,12 @@ def run_inspection(
                 inspector.set_reference(ref_gray)
                 temporal.reset()
                 if position_lock is not None:
-                    position_lock._tpl = ref_template
-                    position_lock.reset()
+                    focused_tpl, tpl_offset = _focused_template(ref_gray, ref_template)
+                    position_lock.update_template(
+                        focused_tpl,
+                        roi_offset    = tpl_offset,
+                        full_roi_size = (roi[2], roi[3]),
+                    )
                 print("[INFO] Reference updated.")
             else:
                 print("[INFO] Reference recapture cancelled.")
@@ -358,8 +398,18 @@ def main() -> None:
     # ---- Position lock ---------------------------------------------
     position_lock: PositionLock | None = None
     if POSITION_LOCK_ENABLED:
-        position_lock = PositionLock(ref_template)
-        print(f"[INFO] Position lock ON — template {ref_template.shape[1]}×{ref_template.shape[0]} px")
+        inspector.set_reference(ref_gray)   # needed so _focused_template can binarise
+        focused_tpl, tpl_offset = _focused_template(ref_gray, ref_template)
+        position_lock = PositionLock(
+            focused_tpl,
+            roi_offset   = tpl_offset,
+            full_roi_size = (roi[2], roi[3]),
+        )
+        print(
+            f"[INFO] Position lock ON — "
+            f"focused template {focused_tpl.shape[1]}×{focused_tpl.shape[0]} px"
+            f"  offset={tpl_offset}"
+        )
     else:
         print("[INFO] Position lock OFF — fixed ROI mode")
 
