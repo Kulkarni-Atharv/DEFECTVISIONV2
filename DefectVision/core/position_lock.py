@@ -19,8 +19,15 @@ class PositionLock:
     Subsequent calls: restricted ±SEARCH_MARGIN window around last known
     position — typically completes in < 5 ms on CM5 at 1456×1088.
 
+    Multi-template support
+    ----------------------
+    Pass a list of templates (one per reference angle) so that different
+    print orientations are all matched.  The template with the highest NCC
+    score wins each frame.  All templates must have the same height/width
+    (they are normalised to a common size by capture_reference_video).
+
     Focused-template support
-     ------------------------
+    ------------------------
     When the drawn ROI is large (contains a lot of background), the raw ROI
     template is dominated by featureless surface and gives low match confidence.
     Pass ``roi_offset`` and ``full_roi_size`` so the position lock can work on
@@ -35,20 +42,22 @@ class PositionLock:
 
     def __init__(
         self,
-        template_gray: np.ndarray,
+        templates: np.ndarray | list,
         roi_offset: tuple[int, int] = (0, 0),
         full_roi_size: tuple[int, int] | None = None,
     ) -> None:
-        self._tpl: np.ndarray = template_gray
-        self._th, self._tw   = template_gray.shape[:2]
-        self._margin: int    = POSITION_LOCK_SEARCH_MARGIN
+        if isinstance(templates, np.ndarray):
+            templates = [templates]
+        self._templates: list[np.ndarray] = list(templates)
+        self._th, self._tw = self._templates[0].shape[:2]
+        self._margin: int      = POSITION_LOCK_SEARCH_MARGIN
         self._match_thr: float = POSITION_LOCK_THRESHOLD
         self._blur_thr:  float = POSITION_LOCK_BLUR_THRESHOLD
         self._last_pos: tuple[int, int] | None = None
 
         # Offset of focused template top-left within the full drawn ROI.
         # (0, 0) means the template IS the full ROI (no adjustment needed).
-        self._roi_offset:   tuple[int, int]          = roi_offset
+        self._roi_offset:    tuple[int, int]         = roi_offset
         self._full_roi_size: tuple[int, int] | None  = full_roi_size
 
     # ------------------------------------------------------------------
@@ -57,27 +66,29 @@ class PositionLock:
 
     def update_template(
         self,
-        template_gray: np.ndarray,
+        templates: np.ndarray | list,
         roi_offset: tuple[int, int] = (0, 0),
         full_roi_size: tuple[int, int] | None = None,
     ) -> None:
-        """Replace the template (called on reference recapture)."""
-        self._tpl         = template_gray
-        self._th, self._tw = template_gray.shape[:2]
-        self._roi_offset  = roi_offset
+        """Replace the templates (called on reference recapture)."""
+        if isinstance(templates, np.ndarray):
+            templates = [templates]
+        self._templates     = list(templates)
+        self._th, self._tw  = self._templates[0].shape[:2]
+        self._roi_offset    = roi_offset
         self._full_roi_size = full_roi_size
-        self._last_pos    = None
+        self._last_pos      = None
 
     def find(
         self, frame_gray: np.ndarray
     ) -> tuple[tuple[int, int, int, int], float] | None:
         """
-        Search for the template in *frame_gray* (full-frame raw grayscale).
+        Search for any of the stored templates in *frame_gray*.
 
         Returns
         -------
-        ((x, y, w, h), confidence)  in full-frame pixel coordinates
-        (adjusted to the full drawn ROI when a focused template is used), or
+        ((x, y, w, h), confidence)  in frame pixel coordinates
+        (adjusted to the full drawn ROI when roi_offset is set), or
         None if the print is not found or the frame is too blurry.
         """
         fh, fw = frame_gray.shape
@@ -95,28 +106,34 @@ class PositionLock:
             region = frame_gray
             ox, oy = 0, 0
 
-        if region.shape[0] < self._th or region.shape[1] < self._tw:
+        # --- match all templates, keep the best NCC ----------------------
+        best_conf = -1.0
+        best_mx, best_my = 0, 0
+        best_tw, best_th = self._tw, self._th
+
+        for tpl in self._templates:
+            th_t, tw_t = tpl.shape[:2]
+            if th_t > region.shape[0] or tw_t > region.shape[1]:
+                continue
+            res = cv2.matchTemplate(region, tpl, cv2.TM_CCOEFF_NORMED)
+            _, conf, _, loc = cv2.minMaxLoc(res)
+            if conf > best_conf:
+                best_conf = conf
+                best_mx   = loc[0] + ox
+                best_my   = loc[1] + oy
+                best_tw   = tw_t
+                best_th   = th_t
+
+        if best_conf < self._match_thr:
             self._last_pos = None
             return None
 
-        # --- template match ----------------------------------------------
-        result = cv2.matchTemplate(region, self._tpl, cv2.TM_CCOEFF_NORMED)
-        _, conf, _, loc = cv2.minMaxLoc(result)
-
-        if conf < self._match_thr:
-            self._last_pos = None
-            return None
-
-        mx = loc[0] + ox
-        my = loc[1] + oy
-
-        # Clamp to frame bounds
-        mx = int(np.clip(mx, 0, fw - self._tw))
-        my = int(np.clip(my, 0, fh - self._th))
+        mx = int(np.clip(best_mx, 0, fw - best_tw))
+        my = int(np.clip(best_my, 0, fh - best_th))
 
         # --- blur gate ---------------------------------------------------
         if self._blur_thr > 0:
-            crop = frame_gray[my: my + self._th, mx: mx + self._tw]
+            crop = frame_gray[my: my + best_th, mx: mx + best_tw]
             lap_var = float(cv2.Laplacian(crop, cv2.CV_64F).var())
             if lap_var < self._blur_thr:
                 return None
@@ -131,9 +148,9 @@ class PositionLock:
             ry = max(0, my - oy_roi)
             rx = int(np.clip(rx, 0, fw - full_w))
             ry = int(np.clip(ry, 0, fh - full_h))
-            return (rx, ry, full_w, full_h), float(conf)
+            return (rx, ry, full_w, full_h), float(best_conf)
 
-        return (mx, my, self._tw, self._th), float(conf)
+        return (mx, my, best_tw, best_th), float(best_conf)
 
     def reset(self) -> None:
         """Call when a new reference is captured so the next find() does a
