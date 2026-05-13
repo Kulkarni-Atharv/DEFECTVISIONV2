@@ -247,6 +247,58 @@ def capture_reference_multi(
 
 
 # ====================================================================
+# Detection worker — runs in background thread
+# ====================================================================
+
+def _run_detection(
+    frame: np.ndarray,
+    current_roi: tuple,
+    ref_grays: list,
+    preprocessor: Preprocessor,
+    aligner: Aligner,
+    inspector: Inspector,
+    match_conf: float,
+    best_tpl_idx: int,
+) -> tuple:
+    """Extract ROI → preprocess → NCC rank → ECC align → inspect.
+    All CPU-bound work is here so the main thread is never blocked.
+    Returns (result, roi_bgr, best_ref, best_live_aligned).
+    """
+    roi_bgr   = _grab_roi(frame, current_roi)
+    live_gray = preprocessor.process(roi_bgr)
+
+    if live_gray.shape != ref_grays[0].shape:
+        live_gray = cv2.resize(
+            live_gray, (ref_grays[0].shape[1], ref_grays[0].shape[0])
+        )
+
+    if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
+        check_indices = [min(best_tpl_idx, len(ref_grays) - 1)]
+    elif len(ref_grays) == 1:
+        check_indices = [0]
+    else:
+        ncc_scores    = [_quick_ncc(live_gray, r) for r in ref_grays]
+        check_indices = sorted(range(len(ref_grays)), key=lambda i: -ncc_scores[i])
+
+    best_result = None
+    best_ref    = ref_grays[0]
+    best_live   = live_gray
+    for i in check_indices:
+        ref     = ref_grays[i]
+        inspector.set_reference(ref)
+        aligned = aligner.align(ref, live_gray)
+        res     = inspector.inspect(ref, aligned)
+        if best_result is None or res.defect_score < best_result.defect_score:
+            best_result = res
+            best_ref    = ref
+            best_live   = aligned
+        if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
+            break
+
+    return best_result, roi_bgr, best_ref, best_live
+
+
+# ====================================================================
 # Main inspection loop
 # ====================================================================
 
@@ -263,6 +315,8 @@ def run_inspection(
     logger: DefectLogger,
     position_lock: PositionLock | None = None,
 ) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     inspector.set_reference(ref_grays[0])
     temporal.reset()
     if position_lock is not None:
@@ -278,178 +332,159 @@ def run_inspection(
     fps_t0      = time.monotonic()
     fps_counter = 0
 
-    from core.inspector import InspectionResult
-    result           = InspectionResult()
+    # Last-known detection state — overlaid on the live feed every frame
     smoothed_score   = 0.0
     confirmed_defect = False
+    warming_up       = True
     match_conf       = 0.0
     current_roi      = roi
-    paused           = False
     best_tpl_idx     = 0
+    paused           = False
+    last_panel       = None
+    last_roi_bgr     = np.zeros((4, 4, 3), dtype=np.uint8)
+    det_future       = None
 
     grabber = _FrameGrabber(cap)
     print("[INFO] Inspection running.  Q=quit  R=new reference  S=snapshot  SPACE=pause")
 
-    while True:
-        if not paused:
-            ret, frame = grabber.read()
-            if not ret:
-                continue
-
-            frame_num   += 1
-            fps_counter += 1
-            if fps_counter >= 30:
-                fps         = fps_counter / max(time.monotonic() - fps_t0, 1e-6)
-                fps_t0      = time.monotonic()
-                fps_counter = 0
-
-            # ---- Position lock: search the full frame ----------------
-            # The focused template is small (text only); searching the full
-            # frame is fast and the roi_offset math inside find() is correct
-            # only when the full frame is passed.
-            if position_lock is not None:
-                frame_gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                match = position_lock.find(frame_gray_full)
-
-                if match is None:
-                    main_display = frame.copy()
-                    main_display = visualizer.draw_main_overlay(
-                        main_display, current_roi,
-                        confirmed_defect=False, smoothed_score=0.0,
-                        warming_up=False, match_conf=0.0, searching=True,
-                    )
-                    cv2.putText(main_display,
-                                f"FPS: {fps:.1f}  Frame: {frame_num}",
-                                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
-                    cv2.imshow(WIN_MAIN, main_display)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord(' '):
-                        paused = not paused
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        while True:
+            if not paused:
+                ret, frame = grabber.read()
+                if not ret:
+                    cv2.waitKey(1)
                     continue
 
-                # find() already applied roi_offset → current_roi is in frame coords
-                current_roi, match_conf, best_tpl_idx = match
-            else:
-                current_roi  = roi
-                match_conf   = 0.0   # no position lock — trigger multi-ref path below
-                best_tpl_idx = 0
+                frame_num   += 1
+                fps_counter += 1
+                if fps_counter >= 30:
+                    fps         = fps_counter / max(time.monotonic() - fps_t0, 1e-6)
+                    fps_t0      = time.monotonic()
+                    fps_counter = 0
 
-            # ---- Extract and preprocess live ROI ---------------------
-            roi_bgr   = _grab_roi(frame, current_roi)
-            live_gray = preprocessor.process(roi_bgr)
-
-            if live_gray.shape != ref_grays[0].shape:
-                live_gray = cv2.resize(
-                    live_gray,
-                    (ref_grays[0].shape[1], ref_grays[0].shape[0]),
-                )
-
-            # ---- Align + inspect against references ------------------
-            # Fast path: position lock identified the angle confidently —
-            # one ECC call, done.
-            # Optimised path: cheap downscaled NCC ranks all refs in <1 ms,
-            # then ECC + inspect runs only on the best candidate first.
-            # Early-exit at INSPECT_EARLY_EXIT_SCORE means clean prints
-            # almost always cost exactly one ECC call regardless of N angles.
-            if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
-                check_indices = [min(best_tpl_idx, len(ref_grays) - 1)]
-            elif len(ref_grays) == 1:
-                check_indices = [0]
-            else:
-                ncc_scores    = [_quick_ncc(live_gray, r) for r in ref_grays]
-                check_indices = sorted(range(len(ref_grays)), key=lambda i: -ncc_scores[i])
-
-            best_result = None
-            best_ref    = ref_grays[0]
-            best_live   = live_gray
-            for i in check_indices:
-                ref     = ref_grays[i]
-                inspector.set_reference(ref)   # must update per-ref; shape check alone is not enough
-                aligned = aligner.align(ref, live_gray)
-                res     = inspector.inspect(ref, aligned)
-                if best_result is None or res.defect_score < best_result.defect_score:
-                    best_result = res
-                    best_ref    = ref
-                    best_live   = aligned
-                if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
-                    break
-            result    = best_result
-            live_gray = best_live
-
-            # ---- Temporal consistency --------------------------------
-            warming_up = not temporal.window_full
-            smoothed_score, confirmed_defect = temporal.update(
-                result.defect_score, result.is_defect
-            )
-            if warming_up:
-                confirmed_defect = False
-
-            logger.log(frame_num, result, confirmed_defect, smoothed_score, roi_bgr)
-
-            # ---- Main feed -------------------------------------------
-            main_display = frame.copy()
-            main_display = visualizer.draw_main_overlay(
-                main_display, current_roi, confirmed_defect, smoothed_score,
-                warming_up, match_conf,
-            )
-            cv2.putText(main_display,
-                        f"FPS: {fps:.1f}  Frame: {frame_num}",
-                        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
-            cv2.imshow(WIN_MAIN, main_display)
-
-            panel = visualizer.build_panel(
-                roi_bgr, best_ref, live_gray,
-                result, confirmed_defect, smoothed_score, fps, warming_up, match_conf,
-            )
-            cv2.imshow(WIN_PANEL, panel)
-
-        else:
-            cv2.waitKey(50)
-
-        # ---- Key handling --------------------------------------------
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('q'):
-            break
-
-        elif key == ord(' '):
-            paused = not paused
-            print(f"[INFO] {'Paused' if paused else 'Resumed'}")
-
-        elif key == ord('r'):
-            print("[INFO] Recapturing references — position clean sample in ROI ...")
-            grabber.stop()
-            cap_result = capture_reference_multi(cap, roi, preprocessor)
-            grabber = _FrameGrabber(cap)
-            if cap_result is not None:
-                ref_grays, ref_templates = cap_result
-                inspector.set_reference(ref_grays[0])
-                temporal.reset()
+                # ---- Position lock -----------------------------------
                 if position_lock is not None:
-                    focused_tpls = []
-                    tpl_offsets  = []
-                    for rg, rt in zip(ref_grays, ref_templates):
-                        tpl, off = _focused_template(rg, rt)
-                        focused_tpls.append(tpl)
-                        tpl_offsets.append(off)
-                    position_lock.update_template(
-                        focused_tpls,
-                        roi_offsets   = tpl_offsets,
-                        full_roi_size = (roi[2], roi[3]),
-                    )
-                print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
-            else:
-                print("[INFO] Reference recapture cancelled.")
+                    frame_gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    match = position_lock.find(frame_gray_full)
+                    if match is None:
+                        main_display = visualizer.draw_main_overlay(
+                            frame.copy(), current_roi,
+                            confirmed_defect=False, smoothed_score=0.0,
+                            warming_up=False, match_conf=0.0, searching=True,
+                        )
+                        cv2.putText(main_display,
+                                    f"FPS: {fps:.1f}  Frame: {frame_num}",
+                                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.65, (200, 200, 200), 1)
+                        cv2.imshow(WIN_MAIN, main_display)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            break
+                        elif key == ord(' '):
+                            paused = not paused
+                        continue
+                    current_roi, match_conf, best_tpl_idx = match
+                else:
+                    current_roi  = roi
+                    match_conf   = 0.0
+                    best_tpl_idx = 0
 
-        elif key == ord('s'):
-            snap_path = os.path.join(
-                LOG_DIR,
-                f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
-            )
-            cv2.imwrite(snap_path, roi_bgr)
-            print(f"[INFO] Snapshot saved: {snap_path}")
+                # ---- Harvest completed detection ---------------------
+                if det_future is not None and det_future.done():
+                    try:
+                        det_result, roi_bgr, best_ref, best_live = det_future.result()
+                        _wu = not temporal.window_full
+                        smoothed_score, confirmed_defect = temporal.update(
+                            det_result.defect_score, det_result.is_defect
+                        )
+                        if _wu:
+                            confirmed_defect = False
+                        warming_up   = _wu
+                        last_roi_bgr = roi_bgr
+                        logger.log(frame_num, det_result, confirmed_defect,
+                                   smoothed_score, roi_bgr)
+                        last_panel = visualizer.build_panel(
+                            roi_bgr, best_ref, best_live,
+                            det_result, confirmed_defect, smoothed_score,
+                            fps, warming_up, match_conf,
+                        )
+                    except Exception as e:
+                        print(f"[WARN] Detection error: {e}")
+                    det_future = None
+
+                # ---- Submit new detection if worker is free ----------
+                if det_future is None:
+                    det_future = executor.submit(
+                        _run_detection,
+                        frame.copy(), current_roi, ref_grays[:],
+                        preprocessor, aligner, inspector,
+                        match_conf, best_tpl_idx,
+                    )
+
+                # ---- Live feed: always updated, never blocked --------
+                main_display = visualizer.draw_main_overlay(
+                    frame.copy(), current_roi, confirmed_defect, smoothed_score,
+                    warming_up, match_conf,
+                )
+                cv2.putText(main_display,
+                            f"FPS: {fps:.1f}  Frame: {frame_num}",
+                            (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (200, 200, 200), 1)
+                cv2.imshow(WIN_MAIN, main_display)
+                if last_panel is not None:
+                    cv2.imshow(WIN_PANEL, last_panel)
+
+            else:
+                cv2.waitKey(50)
+
+            # ---- Key handling ----------------------------------------
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('q'):
+                break
+
+            elif key == ord(' '):
+                paused = not paused
+                print(f"[INFO] {'Paused' if paused else 'Resumed'}")
+
+            elif key == ord('r'):
+                print("[INFO] Recapturing references — position clean sample in ROI ...")
+                if det_future is not None:
+                    try:
+                        det_future.result(timeout=2.0)
+                    except Exception:
+                        pass
+                    det_future = None
+                grabber.stop()
+                cap_result = capture_reference_multi(cap, roi, preprocessor)
+                grabber = _FrameGrabber(cap)
+                if cap_result is not None:
+                    ref_grays, ref_templates = cap_result
+                    inspector.set_reference(ref_grays[0])
+                    temporal.reset()
+                    if position_lock is not None:
+                        focused_tpls = []
+                        tpl_offsets  = []
+                        for rg, rt in zip(ref_grays, ref_templates):
+                            tpl, off = _focused_template(rg, rt)
+                            focused_tpls.append(tpl)
+                            tpl_offsets.append(off)
+                        position_lock.update_template(
+                            focused_tpls,
+                            roi_offsets   = tpl_offsets,
+                            full_roi_size = (roi[2], roi[3]),
+                        )
+                    print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
+                else:
+                    print("[INFO] Reference recapture cancelled.")
+
+            elif key == ord('s'):
+                snap_path = os.path.join(
+                    LOG_DIR,
+                    f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                cv2.imwrite(snap_path, last_roi_bgr)
+                print(f"[INFO] Snapshot saved: {snap_path}")
 
     grabber.stop()
     cv2.destroyAllWindows()
