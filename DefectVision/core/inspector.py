@@ -13,6 +13,7 @@ from config import (
     NCC_WEIGHT,
     DEFECT_SCORE_THRESHOLD,
     TEXT_CROP_MARGIN,
+    DEBRIS_TEXT_ZONE_PX,
 )
 
 
@@ -45,49 +46,56 @@ _TOL_PURITY = cv2.getStructuringElement(
     cv2.MORPH_ELLIPSE,
     (TEXT_TOLERANCE_PURITY_PX * 2 + 1, TEXT_TOLERANCE_PURITY_PX * 2 + 1),
 )
+# Zone around reference strokes where extra ink is allowed to be flagged.
+# Extra ink OUTSIDE this zone is a background/margin artifact — ignored.
+_ZONE_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (DEBRIS_TEXT_ZONE_PX * 2 + 1, DEBRIS_TEXT_ZONE_PX * 2 + 1),
+)
+# Wider zone used by debris-only mode to define "near text" for component search.
+_DEBRIS_ZONE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
 
 _MIN_CONTOUR_AREA = 15
 
 
 class Inspector:
     """
-    Text-structure inspection engine — position-invariant.
+    Text-structure inspection engine — two operating modes.
 
-    How it works
-    ────────────
-    The text is located independently in the reference and in the live
-    frame by binarising each image and taking the bounding box of all
-    ink pixels.  Both images are then cropped to their respective text
-    regions (plus TEXT_CROP_MARGIN px on every side to capture nearby
-    debris) and the live crop is resized to match the reference crop.
+    MODE 1 — Reference comparison  (NCC ≥ NCC_MATCH_THRESHOLD)
+    ────────────────────────────────────────────────────────────
+    The text is located independently in the reference and live image
+    via binarisation + bounding-box.  Both are cropped to their text
+    regions and the crops are compared shape-for-shape (position-invariant).
 
-    Comparing crops instead of full ROI images means the algorithm is
-    completely insensitive to WHERE the text sits in the frame.  A
-    cylinder rotating past the camera will place the text at different
-    horizontal positions on each pass — this produces zero false
-    positives.  Only changes to the TEXT SHAPE itself (debris added,
-    ink missing, smear) change the comparison result.
+    Purity (extra-ink) is restricted to a zone around the reference text
+    strokes (DEBRIS_TEXT_ZONE_PX dilation).  Background artifacts at the
+    crop margin — surface creases, lighting edges — that are not near any
+    character stroke are silently ignored.
 
-    Signals — computed on the text crops
-    ─────────────────────────────────────
-    Recall   – fraction of reference ink present in live  (missing characters)
-    Purity   – inverse fraction of extra ink in live       (smear / debris)
-    NCC      – normalised cross-correlation of binary masks (shape distortion)
+    MODE 2 — Debris-only  (NCC < NCC_MATCH_THRESHOLD)
+    ───────────────────────────────────────────────────
+    Called when no captured reference angle matches the current frame
+    well enough for reliable shape comparison.  No reference is used.
 
-    Debris hard override
-    ────────────────────
-    Any extra-ink connected component ≥ DEBRIS_MIN_COMPONENT_AREA px²
-    that survived the purity tolerance is flagged as DEFECT regardless
-    of the composite score.
+    Algorithm:
+      1. Binarise live frame → all ink blobs
+      2. Classify blobs: large ones (≥ 30 % of largest) = characters
+      3. Dilate character mask to define "near text" zone
+      4. Small blobs (≥ DEBRIS_MIN_COMPONENT_AREA) inside the zone = debris
+      5. Any such blob → DEFECT
+
+    This gives the system independent judgement: it detects debris ON the
+    text without caring where on the cylinder the text currently sits.
+    Missing-character detection is not performed in this mode (can't
+    distinguish angle-mismatch from genuinely missing ink).
     """
 
     def __init__(self) -> None:
         self._ref_bin:  np.ndarray | None = None
         self._ref_area: int = 0
         self._polarity: str = 'dark'
-        self._ref_bbox: tuple | None = None   # (x, y, w, h) of text in ref
-        # Cache keyed by (data_ptr, nbytes) — stable for the lifetime of
-        # each captured reference array; cleared on reference recapture.
+        self._ref_bbox: tuple | None = None
         self._cache: dict[tuple, tuple] = {}
 
     # ------------------------------------------------------------------
@@ -108,7 +116,7 @@ class Inspector:
         self._cache.clear()
 
     # ------------------------------------------------------------------
-    # Main entry point
+    # Mode 1 — Reference comparison
     # ------------------------------------------------------------------
     def inspect(self, reference: np.ndarray, live: np.ndarray) -> InspectionResult:
         result = InspectionResult()
@@ -123,9 +131,7 @@ class Inspector:
         ref_bin  = self._ref_bin
         live_bin = self._binarize(live, self._polarity)
 
-        # ---- Text-centric crop -----------------------------------------
-        # Locate text in both images independently, crop to just the text
-        # region so positional shift does not affect the comparison.
+        # ---- Text-centric crop (position-invariant) --------------------
         ref_bbox  = self._ref_bbox
         live_bbox = Inspector._text_bbox(live_bin, TEXT_CROP_MARGIN)
 
@@ -134,16 +140,13 @@ class Inspector:
             lx, ly, lw, lh = live_bbox
             cmp_ref  = ref_bin[ry:ry + rh, rx:rx + rw]
             cmp_live = live_bin[ly:ly + lh, lx:lx + lw]
-            # Resize live crop to reference crop dimensions so the binary
-            # masks are the same size for set-difference operations.
             if cmp_live.shape != cmp_ref.shape:
                 cmp_live = cv2.resize(
                     cmp_live, (rw, rh), interpolation=cv2.INTER_NEAREST
                 )
             cmp_area = max(int(np.count_nonzero(cmp_ref)), 1)
-            ox, oy   = lx, ly   # live-crop origin in full-ROI coords
+            ox, oy   = lx, ly
         else:
-            # Fallback: text not detected in one or both — full-image compare
             cmp_ref  = ref_bin
             cmp_live = live_bin
             cmp_area = self._ref_area
@@ -157,9 +160,13 @@ class Inspector:
         missing = cv2.bitwise_and(cmp_ref, cv2.bitwise_not(live_tol_recall))
         recall  = 1.0 - float(np.count_nonzero(missing)) / cmp_area
 
-        # ---- Signal 2: Purity — extra ink ------------------------------
-        extra  = cv2.bitwise_and(cmp_live, cv2.bitwise_not(ref_tol_purity))
-        purity = 1.0 - float(np.count_nonzero(extra)) / cmp_area
+        # ---- Signal 2: Purity — extra ink, zone-restricted -------------
+        # Only flag extra pixels that fall within DEBRIS_TEXT_ZONE_PX of a
+        # reference stroke.  Margin/background artifacts are ignored.
+        text_zone   = cv2.dilate(cmp_ref, _ZONE_KERNEL)
+        extra_raw   = cv2.bitwise_and(cmp_live, cv2.bitwise_not(ref_tol_purity))
+        extra       = cv2.bitwise_and(extra_raw, text_zone)
+        purity      = 1.0 - float(np.count_nonzero(extra)) / cmp_area
 
         # ---- Signal 3: NCC — structural shape --------------------------
         ref_f  = cmp_ref.astype(np.float64)
@@ -178,7 +185,7 @@ class Inspector:
         result.defect_score = float(np.clip(defect_score, 0.0, 1.0))
         result.is_defect    = result.defect_score >= DEFECT_SCORE_THRESHOLD
 
-        # ---- Debris hard override --------------------------------------
+        # ---- Debris hard override (zone-restricted) --------------------
         if not result.is_defect and np.count_nonzero(extra) > 0:
             n_lbl, _, stats, _ = cv2.connectedComponentsWithStats(
                 extra, connectivity=8
@@ -191,9 +198,7 @@ class Inspector:
                 result.is_defect    = True
                 result.defect_score = max(result.defect_score, DEFECT_SCORE_THRESHOLD)
 
-        # ---- Full-size maps (visualiser expects ROI-sized arrays) ------
-        # Embed crop results at the live text position so the heatmap
-        # shows defects where they actually appear in the frame.
+        # ---- Full-size maps for visualiser -----------------------------
         full_diff = np.zeros((H, W), dtype=np.uint8)
         full_edge = np.zeros((H, W), dtype=np.uint8)
         full_ssim = np.ones((H, W),  dtype=np.float64)
@@ -217,7 +222,7 @@ class Inspector:
         result.edge_diff_map    = full_edge
         result.ssim_map         = full_ssim
 
-        # ---- Defect localisation (in full-ROI coordinates) -------------
+        # ---- Defect localisation ---------------------------------------
         defect_px = crop_diff.copy()
         defect_px = cv2.morphologyEx(defect_px, cv2.MORPH_CLOSE,  _DILATE_KERNEL)
         defect_px = cv2.morphologyEx(defect_px, cv2.MORPH_DILATE, _DILATE_KERNEL)
@@ -232,7 +237,77 @@ class Inspector:
             for c in result.defect_contours
             for x, y, bw, bh in [cv2.boundingRect(c)]
         ]
+        return result
 
+    # ------------------------------------------------------------------
+    # Mode 2 — Reference-free debris detection
+    # ------------------------------------------------------------------
+    def inspect_debris_only(self, live: np.ndarray) -> InspectionResult:
+        """
+        Detects debris ON or near text without using any reference image.
+        Called when no captured angle matches the current frame.
+
+        Logic:
+          - Large ink blobs  → text characters (expected, OK)
+          - Small ink blobs that are NEAR a character → debris (DEFECT)
+          - Small ink blobs far from any character    → background noise (ignored)
+        """
+        result = InspectionResult()
+        H, W   = live.shape[:2]
+
+        # Full-size clean maps as default
+        result.diff_map      = np.zeros((H, W), dtype=np.uint8)
+        result.edge_diff_map = np.zeros((H, W), dtype=np.uint8)
+        result.ssim_map      = np.ones((H, W),  dtype=np.float64)
+
+        live_bin = self._binarize(live, self._polarity)
+        n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(
+            live_bin, connectivity=8
+        )
+        if n_lbl <= 1:
+            return result  # no ink at all
+
+        areas    = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n_lbl)]
+        max_area = max(areas)
+        char_min = max_area * 0.30   # blobs ≥ 30 % of largest = characters
+
+        # Separate character blobs from small blobs
+        char_mask  = np.zeros_like(live_bin)
+        candidates = []
+        for i in range(1, n_lbl):
+            a = stats[i, cv2.CC_STAT_AREA]
+            if a >= char_min:
+                char_mask[labels == i] = 255
+            elif a >= DEBRIS_MIN_COMPONENT_AREA:
+                candidates.append(i)
+
+        if not candidates:
+            return result  # no small blobs near text
+
+        # Zone around characters where debris is meaningful
+        text_zone    = cv2.dilate(char_mask, _DEBRIS_ZONE_KERNEL)
+        debris_mask  = np.zeros_like(live_bin)
+
+        for i in candidates:
+            comp = ((labels == i).astype(np.uint8) * 255)
+            if np.count_nonzero(cv2.bitwise_and(comp, text_zone)) > 0:
+                debris_mask = cv2.bitwise_or(debris_mask, comp)
+
+        if np.count_nonzero(debris_mask) == 0:
+            return result
+
+        result.is_defect    = True
+        result.defect_score = DEFECT_SCORE_THRESHOLD
+        result.diff_map     = debris_mask
+        result.ssim_map[debris_mask > 0] = 0.0
+
+        contours, _ = cv2.findContours(
+            debris_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        result.defect_contours = [
+            c for c in contours if cv2.contourArea(c) >= _MIN_CONTOUR_AREA
+        ]
+        result.defect_bboxes = [cv2.boundingRect(c) for c in result.defect_contours]
         return result
 
     # ------------------------------------------------------------------
@@ -254,7 +329,6 @@ class Inspector:
     # ------------------------------------------------------------------
     @staticmethod
     def _text_bbox(bin_mask: np.ndarray, margin: int = 0) -> tuple | None:
-        """Bounding box of all ink pixels + margin. Returns (x,y,w,h) or None."""
         pts = cv2.findNonZero(bin_mask)
         if pts is None:
             return None
@@ -282,8 +356,9 @@ class Inspector:
             features = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
 
         features = cv2.GaussianBlur(features, (3, 3), 0)
-        _, bin_mask = cv2.threshold(features, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
+        _, bin_mask = cv2.threshold(
+            features, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, _CLOSE_KERNEL)
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN,  _OPEN_KERNEL)
 

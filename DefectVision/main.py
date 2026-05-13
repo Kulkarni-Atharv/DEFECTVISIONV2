@@ -34,6 +34,7 @@ from config import (
     POSITION_LOCK_ENABLED,
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
+    NCC_MATCH_THRESHOLD,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -277,16 +278,29 @@ def _run_detection(
         )
 
     if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
-        check_indices = [min(best_tpl_idx, len(ref_grays) - 1)]
+        check_indices   = [min(best_tpl_idx, len(ref_grays) - 1)]
+        best_ncc_score  = 1.0   # position lock already confirmed angle
     elif len(ref_grays) == 1:
-        check_indices = [0]
+        check_indices   = [0]
+        best_ncc_score  = 1.0   # single ref — no choice, always use it
     else:
         # Vectorised batch NCC ranks all refs in ~1ms regardless of N.
         # Cap to top-2: with good NCC ranking the right reference is always
         # in the top-2, so we never need to run ECC on angles 3-30.
-        ncc_scores    = _batch_ncc(live_gray, ref_grays)
-        top2          = np.argsort(ncc_scores)[::-1][:2].tolist()
-        check_indices = top2
+        ncc_scores      = _batch_ncc(live_gray, ref_grays)
+        top2            = np.argsort(ncc_scores)[::-1][:2].tolist()
+        best_ncc_score  = float(ncc_scores[top2[0]])
+        check_indices   = top2
+
+    # MODE 2: angle not captured — debris-only, no reference comparison.
+    # The text angle was never seen during calibration; shape-diff against the
+    # nearest reference would produce spurious missing/extra-ink signals.
+    # Instead, scan for small blobs attached to the text that shouldn't be there.
+    if best_ncc_score < NCC_MATCH_THRESHOLD:
+        best_ref = ref_grays[check_indices[0]]
+        inspector.set_reference(best_ref)   # ensures polarity is set
+        result = inspector.inspect_debris_only(live_gray)
+        return result, roi_bgr, best_ref, live_gray
 
     best_result = None
     best_ref    = ref_grays[0]

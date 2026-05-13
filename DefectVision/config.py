@@ -73,6 +73,16 @@ TEXT_TOLERANCE_PURITY_PX = 2   # tight: catches real smears, rejects aliasing no
 # unrelated background marks on the other side of the ROI.
 TEXT_CROP_MARGIN = 14
 
+# Purity zone: extra-ink (debris) is only flagged within this many px of
+# a reference text stroke.  Background artifacts at the crop margin are
+# ignored.  Increase if debris far from strokes is being missed.
+DEBRIS_TEXT_ZONE_PX = 18
+
+# NCC match threshold: if the best reference NCC score is below this,
+# the angle was not captured.  Switch to reference-free debris-only mode
+# so the system uses its own judgement rather than a mismatched reference.
+NCC_MATCH_THRESHOLD = 0.45
+
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is
 # genuine debris (dot, smear, added stroke) — flag as DEFECT immediately
