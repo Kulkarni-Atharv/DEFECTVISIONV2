@@ -53,6 +53,24 @@ def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
     return frame[y: y + h, x: x + w].copy()
 
 
+def _quick_ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Cheap downscaled NCC to rank reference angles before running ECC.
+    ~0.3 ms per pair at 1/4 scale — used as a pre-filter only, not for scoring.
+    """
+    scale = 4
+    h, w = a.shape[:2]
+    a_s = cv2.resize(a, (max(1, w // scale), max(1, h // scale)), interpolation=cv2.INTER_AREA)
+    b_s = cv2.resize(b, (max(1, w // scale), max(1, h // scale)), interpolation=cv2.INTER_AREA)
+    a_f = a_s.astype(np.float32).ravel()
+    b_f = b_s.astype(np.float32).ravel()
+    a_m = a_f - a_f.mean()
+    b_m = b_f - b_f.mean()
+    denom = np.sqrt(np.dot(a_m, a_m) * np.dot(b_m, b_m))
+    if denom < 1e-6:
+        return 0.0
+    return float(np.clip(np.dot(a_m, b_m) / denom, 0.0, 1.0))
+
+
 def _focused_template(
     ref_gray: np.ndarray,
     ref_template: np.ndarray,
@@ -87,6 +105,19 @@ def _focused_template(
         return crop, (x1, y1)
     except Exception:
         return ref_template, (0, 0)
+
+
+def _save_reference_images(
+    ref_grays: list,
+    ref_templates: list,
+) -> None:
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    save_dir = os.path.join(LOG_DIR, f"references_{ts}")
+    os.makedirs(save_dir, exist_ok=True)
+    for i, (gray, tpl) in enumerate(zip(ref_grays, ref_templates)):
+        cv2.imwrite(os.path.join(save_dir, f"angle_{i+1:02d}_preprocessed.png"), gray)
+        cv2.imwrite(os.path.join(save_dir, f"angle_{i+1:02d}_raw.png"), tpl)
+    print(f"[INFO] Reference images saved to: {save_dir}")
 
 
 # ====================================================================
@@ -179,6 +210,8 @@ def capture_reference_multi(
 
         elif key == ord('q') and not capturing:
             cv2.destroyWindow(WIN)
+            if ref_grays:
+                _save_reference_images(ref_grays, ref_templates)
             return (ref_grays, ref_templates) if ref_grays else None
 
 
@@ -268,7 +301,7 @@ def run_inspection(
                 current_roi, match_conf, best_tpl_idx = match
             else:
                 current_roi  = roi
-                match_conf   = 1.0
+                match_conf   = 0.0   # no position lock — trigger multi-ref path below
                 best_tpl_idx = 0
 
             # ---- Extract and preprocess live ROI ---------------------
@@ -282,18 +315,19 @@ def run_inspection(
                 )
 
             # ---- Align + inspect against references ------------------
-            # Fast path: when position lock is confident (>= SINGLE_REF_CONF)
-            # the template index already tells us which angle is in frame —
-            # skip all other references and save N-1 ECC calls per frame.
-            # Slow path (low confidence or no position lock): check all angles
-            # ordered with the best-guess first, exit early when clearly clean.
-            idx = min(best_tpl_idx, len(ref_grays) - 1)
+            # Fast path: position lock identified the angle confidently —
+            # one ECC call, done.
+            # Optimised path: cheap downscaled NCC ranks all refs in <1 ms,
+            # then ECC + inspect runs only on the best candidate first.
+            # Early-exit at INSPECT_EARLY_EXIT_SCORE means clean prints
+            # almost always cost exactly one ECC call regardless of N angles.
             if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
-                check_indices = [idx]
+                check_indices = [min(best_tpl_idx, len(ref_grays) - 1)]
+            elif len(ref_grays) == 1:
+                check_indices = [0]
             else:
-                check_indices = [idx] + [
-                    i for i in range(len(ref_grays)) if i != idx
-                ]
+                ncc_scores    = [_quick_ncc(live_gray, r) for r in ref_grays]
+                check_indices = sorted(range(len(ref_grays)), key=lambda i: -ncc_scores[i])
 
             best_result = None
             best_ref    = ref_grays[0]
