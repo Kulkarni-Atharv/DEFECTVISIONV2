@@ -33,6 +33,8 @@ class InspectionResult:
     defect_contours: list = field(default_factory=list)
     defect_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
     is_angle_mismatch: bool = False
+    is_text_found: bool = True       # False when no ink blobs found in live ROI
+    is_recognized_angle: bool = True # False when no reference matched this angle
 
 
 # ---- Morphology kernels (built once at import) --------------------------
@@ -293,7 +295,8 @@ class Inspector:
             live_bin, connectivity=8
         )
         if n_lbl <= 1:
-            return result  # no ink at all
+            result.is_text_found = False  # no ink at all in ROI
+            return result
 
         areas    = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n_lbl)]
         max_area = max(areas)
