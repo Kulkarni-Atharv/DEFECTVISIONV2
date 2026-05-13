@@ -81,7 +81,13 @@ DEBRIS_TEXT_ZONE_PX = 18
 # NCC match threshold: if the best reference NCC score is below this,
 # the angle was not captured.  Switch to reference-free debris-only mode
 # so the system uses its own judgement rather than a mismatched reference.
-NCC_MATCH_THRESHOLD = 0.45
+NCC_MATCH_THRESHOLD = 0.60
+
+# Crop-level NCC gate: even if batch NCC passes (above), the crop-level NCC
+# computed inside inspect() may reveal the reference doesn't really fit.
+# If ncc < this, suppress shape-scoring (recall/purity/hard-override) and
+# fall back to debris-only mode in _run_detection().
+INSPECT_NCC_GATE = 0.65
 
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is

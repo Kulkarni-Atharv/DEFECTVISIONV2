@@ -14,6 +14,7 @@ from config import (
     DEFECT_SCORE_THRESHOLD,
     TEXT_CROP_MARGIN,
     DEBRIS_TEXT_ZONE_PX,
+    INSPECT_NCC_GATE,
 )
 
 
@@ -175,6 +176,20 @@ class Inspector:
         live_m = live_f - live_f.mean()
         denom  = np.sqrt(np.sum(ref_m ** 2) * np.sum(live_m ** 2))
         ncc    = float(np.clip(np.sum(ref_m * live_m) / (denom + 1e-8), 0.0, 1.0))
+
+        # ---- Crop-NCC gate ---------------------------------------------
+        # If the crop-level NCC is too low, this reference does not match
+        # the current angle well enough for reliable shape comparison.
+        # Return a neutral result so _run_detection() can fall back to
+        # debris-only mode instead of scoring spurious shape differences.
+        if ncc < INSPECT_NCC_GATE:
+            result.ssim_score       = ncc
+            result.edge_diff_score  = 1.0 - recall
+            result.pixel_diff_score = float(np.clip(1.0 - purity, 0.0, 1.0))
+            result.diff_map         = np.zeros((H, W), dtype=np.uint8)
+            result.edge_diff_map    = np.zeros((H, W), dtype=np.uint8)
+            result.ssim_map         = np.ones((H, W),  dtype=np.float64)
+            return result
 
         # ---- Composite score -------------------------------------------
         defect_score = (
