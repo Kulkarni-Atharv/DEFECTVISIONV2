@@ -19,6 +19,7 @@ Key bindings during inspection:
 from __future__ import annotations
 import argparse
 import sys
+import threading
 import time
 import cv2
 import numpy as np
@@ -51,6 +52,36 @@ os.makedirs(LOG_DIR, exist_ok=True)
 def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = roi
     return frame[y: y + h, x: x + w].copy()
+
+
+class _FrameGrabber:
+    """Background thread that continuously drains the camera buffer so the
+    detection loop always reads the latest frame without being blocked by it."""
+
+    def __init__(self, cap) -> None:
+        self._cap   = cap
+        self._frame: np.ndarray | None = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._t     = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            ret, frame = self._cap.read()
+            if ret:
+                with self._lock:
+                    self._frame = frame
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._t.join(timeout=2.0)
 
 
 def _quick_ncc(a: np.ndarray, b: np.ndarray) -> float:
@@ -256,11 +287,12 @@ def run_inspection(
     paused           = False
     best_tpl_idx     = 0
 
+    grabber = _FrameGrabber(cap)
     print("[INFO] Inspection running.  Q=quit  R=new reference  S=snapshot  SPACE=pause")
 
     while True:
         if not paused:
-            ret, frame = cap.read()
+            ret, frame = grabber.read()
             if not ret:
                 continue
 
@@ -388,7 +420,9 @@ def run_inspection(
 
         elif key == ord('r'):
             print("[INFO] Recapturing references — position clean sample in ROI ...")
+            grabber.stop()
             cap_result = capture_reference_multi(cap, roi, preprocessor)
+            grabber = _FrameGrabber(cap)
             if cap_result is not None:
                 ref_grays, ref_templates = cap_result
                 inspector.set_reference(ref_grays[0])
@@ -417,6 +451,7 @@ def run_inspection(
             cv2.imwrite(snap_path, roi_bgr)
             print(f"[INFO] Snapshot saved: {snap_path}")
 
+    grabber.stop()
     cv2.destroyAllWindows()
 
 

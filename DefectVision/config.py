@@ -45,7 +45,7 @@ ALIGN_MAX_ROTATION_DEG = 10.0  # Reject ECC result if estimated rotation > this
 
 # ECC (Enhanced Correlation Coefficient) parameters.
 # ECC handles translation + rotation; far more robust than phase correlation.
-ALIGN_ECC_MAX_ITER = 10        # Max iterations per frame (10 is sufficient when position lock pre-aligns)
+ALIGN_ECC_MAX_ITER = 50        # 50 needed when position lock is OFF (no pre-alignment, cold start)
 ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 
 # ---- Text binarisation (inspector) --------------------------
@@ -65,8 +65,8 @@ TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real te
 #   PURITY tolerance (extra ink): 2 px absorbs typical stroke-boundary shifts
 #     from frame-to-frame lighting/alignment variation without masking real marks.
 #     1 px was too tight — it let boundary artifacts through as extra-ink clusters.
-TEXT_TOLERANCE_RECALL_PX = 3
-TEXT_TOLERANCE_PURITY_PX = 2
+TEXT_TOLERANCE_RECALL_PX = 5   # absorbs ~5px residual after ECC from cold start
+TEXT_TOLERANCE_PURITY_PX = 3   # tight enough to catch real smears, forgiving of edge shifts
 
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is
@@ -74,7 +74,7 @@ TEXT_TOLERANCE_PURITY_PX = 2
 # regardless of composite score.
 # 30 px² ≈ a 6×5 compact mark — well below any user-visible dot (~5 px radius
 # = 78 px²) but above stroke-boundary noise strips (typically thin and < 20 px²).
-DEBRIS_MIN_COMPONENT_AREA = 30
+DEBRIS_MIN_COMPONENT_AREA = 50   # raised from 30 — edge-shift artifacts are thin strips < 50px²
 
 # Legacy adaptive-threshold params (no longer used; kept for reference)
 ADAPTIVE_BLOCK_SIZE     = 31
