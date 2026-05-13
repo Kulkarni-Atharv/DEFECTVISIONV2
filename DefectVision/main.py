@@ -34,12 +34,11 @@ from config import (
     POSITION_LOCK_ENABLED,
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
-    NCC_MATCH_THRESHOLD,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
 from core.preprocessor    import Preprocessor
-from core.inspector       import Inspector, InspectionResult
+from core.inspector       import Inspector
 from core.temporal_filter import TemporalFilter
 from core.visualizer      import Visualizer
 from core.position_lock   import PositionLock
@@ -277,38 +276,17 @@ def _run_detection(
             live_gray, (ref_grays[0].shape[1], ref_grays[0].shape[0])
         )
 
-    # Early exit: blank ROI — no text visible at all.
-    # Checked before any mode selection so it fires regardless of NCC scores.
-    _live_bin = Inspector._binarize(live_gray, inspector._polarity)
-    if cv2.countNonZero(_live_bin) == 0:
-        _r = InspectionResult()
-        _r.is_text_found       = False
-        _r.is_recognized_angle = False
-        return _r, roi_bgr, ref_grays[0], live_gray
-
     if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
-        check_indices   = [min(best_tpl_idx, len(ref_grays) - 1)]
-        best_ncc_score  = 1.0   # position lock already confirmed angle
+        check_indices = [min(best_tpl_idx, len(ref_grays) - 1)]
     elif len(ref_grays) == 1:
-        check_indices   = [0]
-        best_ncc_score  = 1.0   # single ref — no choice, always use it
+        check_indices = [0]
     else:
         # Vectorised batch NCC ranks all refs in ~1ms regardless of N.
         # Cap to top-2: with good NCC ranking the right reference is always
         # in the top-2, so we never need to run ECC on angles 3-30.
-        ncc_scores      = _batch_ncc(live_gray, ref_grays)
-        top2            = np.argsort(ncc_scores)[::-1][:2].tolist()
-        best_ncc_score  = float(ncc_scores[top2[0]])
-        check_indices   = top2
-
-    # MODE 2 (direct): batch NCC too low — angle never captured.
-    # Can only detect obvious debris; cannot verify print completeness.
-    if best_ncc_score < NCC_MATCH_THRESHOLD:
-        best_ref = ref_grays[check_indices[0]]
-        inspector.set_reference(best_ref)
-        result = inspector.inspect_debris_only(live_gray)
-        result.is_recognized_angle = False
-        return result, roi_bgr, best_ref, live_gray
+        ncc_scores    = _batch_ncc(live_gray, ref_grays)
+        top2          = np.argsort(ncc_scores)[::-1][:2].tolist()
+        check_indices = top2
 
     best_result = None
     best_ref    = ref_grays[0]
@@ -316,24 +294,11 @@ def _run_detection(
         ref = ref_grays[i]
         inspector.set_reference(ref)   # instant — result is cached
         res = inspector.inspect(ref, live_gray)
-        # inspect() returns is_angle_mismatch=True when both recall and
-        # purity are simultaneously degraded (strokes shifted = wrong angle).
-        # Skip those refs; only use ones that give a clean signal.
-        if res.is_angle_mismatch:
-            continue
         if best_result is None or res.defect_score < best_result.defect_score:
             best_result = res
             best_ref    = ref
         if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
             break
-
-    # MODE 2 (fallback): all top-N references showed symmetric angle mismatch.
-    # Can only detect obvious debris; cannot verify print completeness.
-    if best_result is None:
-        best_ref = ref_grays[check_indices[0]]
-        inspector.set_reference(best_ref)
-        best_result = inspector.inspect_debris_only(live_gray)
-        best_result.is_recognized_angle = False
 
     return best_result, roi_bgr, best_ref, live_gray
 
@@ -386,7 +351,6 @@ def run_inspection(
     last_panel       = None
     last_roi_bgr     = np.zeros((4, 4, 3), dtype=np.uint8)
     det_future       = None
-    status_override  = None   # "TEXT NOT FOUND" / "UNRECOGNIZED ANGLE" / None
 
     grabber = _FrameGrabber(cap)
     print("[INFO] Inspection running.  Q=quit  R=new reference  S=snapshot  SPACE=pause")
@@ -437,37 +401,20 @@ def run_inspection(
                 if det_future is not None and det_future.done():
                     try:
                         det_result, roi_bgr, best_ref, best_live = det_future.result()
-                        last_roi_bgr = roi_bgr
-
-                        if not det_result.is_text_found:
-                            # No ink blobs at all — cylinder showing blank surface
-                            status_override  = "TEXT NOT FOUND"
+                        _wu = not temporal.window_full
+                        smoothed_score, confirmed_defect = temporal.update(
+                            det_result.defect_score, det_result.is_defect
+                        )
+                        if _wu:
                             confirmed_defect = False
-                            smoothed_score   = 0.0
-                            warming_up       = False
-                        elif not det_result.is_recognized_angle and not det_result.is_defect:
-                            # Text present but angle not captured; no clear debris.
-                            # Cannot confirm print quality — do NOT declare PASS.
-                            status_override = "UNRECOGNIZED ANGLE"
-                            # Skip temporal filter — verdict requires a captured angle.
-                        else:
-                            # Recognized angle, OR unrecognized angle but debris found.
-                            status_override = None
-                            _wu = not temporal.window_full
-                            smoothed_score, confirmed_defect = temporal.update(
-                                det_result.defect_score, det_result.is_defect
-                            )
-                            if _wu:
-                                confirmed_defect = False
-                            warming_up = _wu
-
+                        warming_up   = _wu
+                        last_roi_bgr = roi_bgr
                         logger.log(frame_num, det_result, confirmed_defect,
                                    smoothed_score, roi_bgr)
                         last_panel = visualizer.build_panel(
                             roi_bgr, best_ref, best_live,
                             det_result, confirmed_defect, smoothed_score,
                             fps, warming_up, match_conf,
-                            status_text=status_override,
                         )
                     except Exception as e:
                         print(f"[WARN] Detection error: {e}")
@@ -486,7 +433,6 @@ def run_inspection(
                 main_display = visualizer.draw_main_overlay(
                     frame.copy(), current_roi, confirmed_defect, smoothed_score,
                     warming_up, match_conf,
-                    status_text=status_override,
                 )
                 cv2.putText(main_display,
                             f"FPS: {fps:.1f}  Frame: {frame_num}",

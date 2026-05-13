@@ -37,12 +37,9 @@ class Visualizer:
         warming_up: bool = False,
         match_conf: float = 1.0,
         searching: bool = False,
-        status_text: str | None = None,
     ) -> np.ndarray:
         x, y, w, h = roi
-        if status_text is not None:
-            color = _YELLOW
-        elif searching:
+        if searching:
             color = _YELLOW
         elif warming_up:
             color = _YELLOW
@@ -66,10 +63,8 @@ class Visualizer:
             cv2.line(frame, (px, py), (px + dx * cl, py), color, 3)
             cv2.line(frame, (px, py), (px, py + dy * cl), color, 3)
 
-        # Status badge above ROI — status_text overrides all defaults
-        if status_text is not None:
-            badge = status_text
-        elif searching:
+        # Status badge above ROI
+        if searching:
             badge = "SEARCHING..."
         elif warming_up:
             badge = "WARMING UP..."
@@ -97,7 +92,6 @@ class Visualizer:
         fps: float,
         warming_up: bool = False,
         match_conf: float = 1.0,
-        status_text: str | None = None,
     ) -> np.ndarray:
         """
         Assemble a 2-column × 2-row grid:
@@ -156,15 +150,12 @@ class Visualizer:
         bar_h = 44
         bar = np.zeros((bar_h, panel.shape[1], 3), dtype=np.uint8)
 
-        if status_text is not None:
-            bar_color  = _YELLOW
-            bar_status = f"{status_text}  |  FPS: {fps:.1f}"
-        elif warming_up:
-            bar_color  = _YELLOW
-            bar_status = f"WARMING UP  |  FPS: {fps:.1f}  Match: {match_conf:.2f}"
+        if warming_up:
+            bar_color = _YELLOW
+            status_text = f"WARMING UP  |  FPS: {fps:.1f}  Match: {match_conf:.2f}"
         elif confirmed_defect:
-            bar_color  = _RED
-            bar_status = (
+            bar_color = _RED
+            status_text = (
                 f"DEFECT  |  Score: {smoothed_score:.3f}"
                 f"  SSIM: {result.ssim_score:.3f}"
                 f"  EdgeDiff: {result.edge_diff_score:.3f}"
@@ -172,8 +163,8 @@ class Visualizer:
                 f"  FPS: {fps:.1f}"
             )
         else:
-            bar_color  = _GREEN
-            bar_status = (
+            bar_color = _GREEN
+            status_text = (
                 f"PASS    |  Score: {smoothed_score:.3f}"
                 f"  SSIM: {result.ssim_score:.3f}"
                 f"  EdgeDiff: {result.edge_diff_score:.3f}"
@@ -182,7 +173,7 @@ class Visualizer:
             )
 
         bar[:] = bar_color
-        cv2.putText(bar, bar_status, (10, 30),
+        cv2.putText(bar, status_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, _WHITE, 2, cv2.LINE_AA)
 
         return np.vstack([panel, bar])
