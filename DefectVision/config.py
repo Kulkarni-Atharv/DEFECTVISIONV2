@@ -134,7 +134,7 @@ POSITION_LOCK_SEARCH_MARGIN  = 80
 POSITION_LOCK_BLUR_THRESHOLD = 8.0
 
 # ---- Logging ------------------------------------------------
-LOG_ENABLED        = True
+LOG_ENABLED        = False
 LOG_DIR            = "logs"
 SNAPSHOT_ON_DEFECT = False
 
