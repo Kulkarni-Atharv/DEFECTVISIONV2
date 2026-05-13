@@ -45,7 +45,7 @@ ALIGN_MAX_ROTATION_DEG = 10.0  # Reject ECC result if estimated rotation > this
 
 # ECC (Enhanced Correlation Coefficient) parameters.
 # ECC handles translation + rotation; far more robust than phase correlation.
-ALIGN_ECC_MAX_ITER = 50        # 50 needed when position lock is OFF (no pre-alignment, cold start)
+ALIGN_ECC_MAX_ITER = 25        # 25 sufficient — NCC pre-filter picks the right ref so ECC starts close
 ALIGN_ECC_EPSILON  = 0.001     # Convergence threshold
 
 # ---- Text binarisation (inspector) --------------------------

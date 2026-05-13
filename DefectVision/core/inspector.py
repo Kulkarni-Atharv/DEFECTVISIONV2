@@ -96,14 +96,24 @@ class Inspector:
         self._ref_bin:  np.ndarray | None = None
         self._ref_area: int = 0
         self._polarity: str = 'dark'
+        # Cache keyed by (data_ptr, nbytes) — stable for lifetime of each
+        # captured reference array, cleared when references are recaptured.
+        self._cache: dict[tuple, tuple] = {}
 
     # ------------------------------------------------------------------
     # Reference setup
     # ------------------------------------------------------------------
     def set_reference(self, ref_gray: np.ndarray) -> None:
-        self._polarity = self._detect_polarity(ref_gray)
-        self._ref_bin  = self._binarize(ref_gray, self._polarity)
-        self._ref_area = max(int(np.count_nonzero(self._ref_bin)), 1)
+        key = (ref_gray.ctypes.data, ref_gray.nbytes)
+        if key not in self._cache:
+            polarity = self._detect_polarity(ref_gray)
+            ref_bin  = self._binarize(ref_gray, polarity)
+            ref_area = max(int(np.count_nonzero(ref_bin)), 1)
+            self._cache[key] = (ref_bin, ref_area, polarity)
+        self._ref_bin, self._ref_area, self._polarity = self._cache[key]
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
 
     # ------------------------------------------------------------------
     # Main entry point
