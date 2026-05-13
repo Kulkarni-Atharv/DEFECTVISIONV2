@@ -14,7 +14,7 @@ from config import (
     DEFECT_SCORE_THRESHOLD,
     TEXT_CROP_MARGIN,
     DEBRIS_TEXT_ZONE_PX,
-    INSPECT_NCC_GATE,
+    MISMATCH_SYM_THRESH,
 )
 
 
@@ -32,6 +32,7 @@ class InspectionResult:
 
     defect_contours: list = field(default_factory=list)
     defect_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    is_angle_mismatch: bool = False
 
 
 # ---- Morphology kernels (built once at import) --------------------------
@@ -177,24 +178,36 @@ class Inspector:
         denom  = np.sqrt(np.sum(ref_m ** 2) * np.sum(live_m ** 2))
         ncc    = float(np.clip(np.sum(ref_m * live_m) / (denom + 1e-8), 0.0, 1.0))
 
-        # ---- Crop-NCC gate ---------------------------------------------
-        # If the crop-level NCC is too low, this reference does not match
-        # the current angle well enough for reliable shape comparison.
-        # Return a neutral result so _run_detection() can fall back to
-        # debris-only mode instead of scoring spurious shape differences.
-        if ncc < INSPECT_NCC_GATE:
-            result.ssim_score       = ncc
-            result.edge_diff_score  = 1.0 - recall
-            result.pixel_diff_score = float(np.clip(1.0 - purity, 0.0, 1.0))
-            result.diff_map         = np.zeros((H, W), dtype=np.uint8)
-            result.edge_diff_map    = np.zeros((H, W), dtype=np.uint8)
-            result.ssim_map         = np.ones((H, W),  dtype=np.float64)
+        # ---- Symmetric mismatch check ----------------------------------
+        # Angle mismatch signature: strokes shift → they appear BOTH
+        # missing (from reference POV) AND extra (in live but offset).
+        # When both recall and purity are simultaneously degraded, that is
+        # angle mismatch, NOT a real defect.
+        #
+        # Asymmetric signals = real defects:
+        #   only purity high  → debris/cross-line added (text still present)
+        #   only recall high  → text faded or character missing
+        #
+        # When mismatch is detected: return a neutral result so
+        # _run_detection() tries the next reference or falls back to
+        # debris-only mode.  The hard override is intentionally skipped
+        # because shifted strokes would also form large "extra" components.
+        missing_frac = 1.0 - recall
+        extra_frac   = float(np.clip(1.0 - purity, 0.0, 1.0))
+        if missing_frac > MISMATCH_SYM_THRESH and extra_frac > MISMATCH_SYM_THRESH:
+            result.ssim_score        = ncc
+            result.edge_diff_score   = missing_frac
+            result.pixel_diff_score  = extra_frac
+            result.is_angle_mismatch = True
+            result.diff_map          = np.zeros((H, W), dtype=np.uint8)
+            result.edge_diff_map     = np.zeros((H, W), dtype=np.uint8)
+            result.ssim_map          = np.ones((H, W),  dtype=np.float64)
             return result
 
         # ---- Composite score -------------------------------------------
         defect_score = (
-            RECALL_WEIGHT * (1.0 - recall) +
-            PURITY_WEIGHT * float(np.clip(1.0 - purity, 0.0, 1.0)) +
+            RECALL_WEIGHT * missing_frac +
+            PURITY_WEIGHT * extra_frac +
             NCC_WEIGHT    * (1.0 - ncc)
         )
         result.defect_score = float(np.clip(defect_score, 0.0, 1.0))

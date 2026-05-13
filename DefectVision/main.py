@@ -35,7 +35,6 @@ from config import (
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
     NCC_MATCH_THRESHOLD,
-    INSPECT_NCC_GATE,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -309,10 +308,10 @@ def _run_detection(
         ref = ref_grays[i]
         inspector.set_reference(ref)   # instant — result is cached
         res = inspector.inspect(ref, live_gray)
-        # inspect() returns a neutral result (defect_score=0, is_defect=False)
-        # when crop NCC < INSPECT_NCC_GATE — skip those; only use refs that
-        # actually match this angle well enough for shape comparison.
-        if res.ssim_score < INSPECT_NCC_GATE:
+        # inspect() returns is_angle_mismatch=True when both recall and
+        # purity are simultaneously degraded (strokes shifted = wrong angle).
+        # Skip those refs; only use ones that give a clean signal.
+        if res.is_angle_mismatch:
             continue
         if best_result is None or res.defect_score < best_result.defect_score:
             best_result = res
@@ -320,7 +319,7 @@ def _run_detection(
         if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
             break
 
-    # No reference cleared the crop-NCC gate → angle not well-captured.
+    # All references showed angle mismatch → angle not well-captured.
     # Debris-only mode: detect marks ON the text without angle dependency.
     if best_result is None:
         best_ref = ref_grays[check_indices[0]]

@@ -83,11 +83,12 @@ DEBRIS_TEXT_ZONE_PX = 18
 # so the system uses its own judgement rather than a mismatched reference.
 NCC_MATCH_THRESHOLD = 0.60
 
-# Crop-level NCC gate: even if batch NCC passes (above), the crop-level NCC
-# computed inside inspect() may reveal the reference doesn't really fit.
-# If ncc < this, suppress shape-scoring (recall/purity/hard-override) and
-# fall back to debris-only mode in _run_detection().
-INSPECT_NCC_GATE = 0.65
+# Symmetric mismatch threshold: if BOTH recall loss AND purity loss exceed
+# this value simultaneously, the pattern indicates angle mismatch (strokes
+# have shifted — they appear both missing and extra at the same time).
+# Asymmetric signals (only purity high = debris added; only recall high =
+# text faded/missing) are real defects and are scored normally.
+MISMATCH_SYM_THRESH = 0.12
 
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is
