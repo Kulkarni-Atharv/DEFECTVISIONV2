@@ -133,14 +133,6 @@ POSITION_LOCK_SEARCH_MARGIN  = 80
 # 10-20 even when perfectly in focus — the old value of 30 falsely rejected them.
 POSITION_LOCK_BLUR_THRESHOLD = 8.0
 
-# ---- Auto-calibration ---------------------------------------
-# System watches incoming frames and locks a reference automatically
-# when text is clearly visible for N consecutive frames.
-# No manual SPACE-press needed for normal operation.
-AUTO_CAL_N_CONFIRM     = 8     # consecutive clear frames needed to lock
-AUTO_CAL_MIN_INK_RATIO = 0.02  # minimum ink fraction within text bbox
-AUTO_CAL_MIN_BLUR_VAR  = 10.0  # minimum Laplacian variance (rejects blur)
-
 # ---- Logging ------------------------------------------------
 LOG_ENABLED        = True
 LOG_DIR            = "logs"

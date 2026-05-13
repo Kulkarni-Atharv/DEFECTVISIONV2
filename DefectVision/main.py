@@ -5,12 +5,7 @@ Entry point.  Run with:
     python main.py
     python main.py --roi 100 50 400 200   # skip GUI ROI selector
 
-Auto-calibration (default startup):
-    System locks automatically once text is clearly visible.
-    SPACE  — switch to manual capture mode
-    Q      — cancel and exit
-
-Manual capture mode (fallback, also R-key during inspection):
+Key bindings during reference capture:
     SPACE  — capture this angle (averages several frames)
     D      — delete last captured angle
     Q      — confirm and start inspection
@@ -40,15 +35,14 @@ from config import (
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
 )
-from core.camera            import create_camera
-from core.roi_selector      import ROISelector
-from core.preprocessor      import Preprocessor
-from core.inspector         import Inspector
-from core.auto_calibrator   import AutoCalibrator
-from core.temporal_filter   import TemporalFilter
-from core.visualizer        import Visualizer
-from core.position_lock     import PositionLock
-from utils.logger           import DefectLogger
+from core.camera          import create_camera
+from core.roi_selector    import ROISelector
+from core.preprocessor    import Preprocessor
+from core.inspector       import Inspector
+from core.temporal_filter import TemporalFilter
+from core.visualizer      import Visualizer
+from core.position_lock   import PositionLock
+from utils.logger         import DefectLogger
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -258,74 +252,6 @@ def capture_reference_multi(
 
 
 # ====================================================================
-# Auto-calibration — builds reference without user interaction
-# ====================================================================
-
-def auto_calibrate(
-    cap,
-    roi: tuple[int, int, int, int],
-    preprocessor: Preprocessor,
-) -> list | None:
-    """
-    Watch live frames until text is clearly visible for
-    AUTO_CAL_N_CONFIRM consecutive frames, then return [reference_gray].
-
-    Returns
-    -------
-    [gray]  — auto-locked reference (list of 1), ready for inspection
-    None    — user pressed SPACE → caller should fall back to manual capture
-    (empty) — user pressed Q → caller should exit
-    """
-    calibrator = AutoCalibrator()
-    WIN = "DefectVision — Auto-Calibrating  [SPACE=manual  Q=cancel]"
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    x, y, w, h = roi
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        crop     = _grab_roi(frame, roi)
-        gray     = preprocessor.process(crop)
-        polarity = Inspector._detect_polarity(gray)
-        bin_mask = Inspector._binarize(gray, polarity)
-        locked   = calibrator.update(gray, bin_mask)
-
-        n, N    = calibrator.progress
-        display = frame.copy()
-
-        if calibrator.state == AutoCalibrator.PENDING:
-            color = (0, 165, 255)
-            label = f"Auto-calibrating: {n}/{N} frames  [SPACE=manual  Q=cancel]"
-        else:
-            color = (0, 210, 255)
-            label = "Searching for text...  [SPACE=manual  Q=cancel]"
-
-        cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(display, label, (10, 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
-        cv2.imshow(WIN, display)
-        key = cv2.waitKey(1) & 0xFF
-
-        if locked:
-            cv2.destroyWindow(WIN)
-            ref = calibrator.reference
-            _save_reference_images([ref], [ref])
-            print(f"[INFO] Auto-calibration locked ({N} frames averaged).")
-            return [ref]
-
-        elif key == ord(' '):
-            cv2.destroyWindow(WIN)
-            print("[INFO] Switching to manual capture mode ...")
-            return None
-
-        elif key == ord('q'):
-            cv2.destroyWindow(WIN)
-            return []
-
-
-# ====================================================================
 # Detection worker — runs in background thread
 # ====================================================================
 
@@ -530,7 +456,7 @@ def run_inspection(
                 print(f"[INFO] {'Paused' if paused else 'Resumed'}")
 
             elif key == ord('r'):
-                print("[INFO] Recalibrating — auto mode  (SPACE=manual  Q=keep current) ...")
+                print("[INFO] Recapturing references — position clean sample in ROI ...")
                 if det_future is not None:
                     try:
                         det_future.result(timeout=2.0)
@@ -538,28 +464,10 @@ def run_inspection(
                         pass
                     det_future = None
                 grabber.stop()
-
-                new_grays     = None
-                new_templates = None
-                auto_result   = auto_calibrate(cap, roi, preprocessor)
-                if auto_result is None:
-                    # SPACE: fall back to manual
-                    cap_result = capture_reference_multi(cap, roi, preprocessor)
-                    if cap_result is not None:
-                        new_grays, new_templates = cap_result
-                    else:
-                        print("[INFO] Reference recapture cancelled — keeping previous.")
-                elif len(auto_result) == 0:
-                    print("[INFO] Recalibration cancelled — keeping previous references.")
-                else:
-                    new_grays     = auto_result
-                    new_templates = auto_result
-
+                cap_result = capture_reference_multi(cap, roi, preprocessor)
                 grabber = _FrameGrabber(cap)
-
-                if new_grays is not None:
-                    ref_grays     = new_grays
-                    ref_templates = new_templates
+                if cap_result is not None:
+                    ref_grays, ref_templates = cap_result
                     inspector.clear_cache()
                     for _r in ref_grays:
                         inspector.set_reference(_r)
@@ -577,6 +485,8 @@ def run_inspection(
                             full_roi_size = (roi[2], roi[3]),
                         )
                     print(f"[INFO] Reference updated: {len(ref_grays)} angle(s).")
+                else:
+                    print("[INFO] Reference recapture cancelled.")
 
             elif key == ord('s'):
                 snap_path = os.path.join(
@@ -641,32 +551,18 @@ def main() -> None:
     x, y, rw, rh = roi
     print(f"[INFO] ROI: x={x} y={y} w={rw} h={rh}")
 
-    # ---- Step 2: Calibrate — auto first, manual fallback ----------------
-    print("[INFO] Step 2: Auto-calibrating — position a clean print in the ROI.")
-    print("[INFO]   The system will lock automatically once text is clearly visible.")
-    print("[INFO]   Press SPACE to switch to manual capture  |  Q to cancel")
-    auto_result = auto_calibrate(cam, roi, preprocessor)
-    if auto_result is None:
-        # User pressed SPACE → manual capture
-        print("[INFO] Manual reference capture mode.")
-        print("[INFO]   SPACE=capture angle  D=undo  Q=confirm")
-        ref_result = capture_reference_multi(cam, roi, preprocessor)
-        if ref_result is None:
-            print("[INFO] Reference capture cancelled.  Exiting.")
-            cam.release()
-            sys.exit(0)
-        ref_grays, ref_templates = ref_result
-    elif len(auto_result) == 0:
-        # User pressed Q → exit
-        print("[INFO] Calibration cancelled.  Exiting.")
+    # ---- Step 2: Capture references at each expected angle --------------
+    print("[INFO] Step 2: Capture reference at each expected angle.")
+    print("[INFO]   Position clean print in ROI → SPACE to capture → repeat → Q to confirm")
+    ref_result = capture_reference_multi(cam, roi, preprocessor)
+    if ref_result is None:
+        print("[INFO] Reference capture cancelled.  Exiting.")
         cam.release()
         sys.exit(0)
-    else:
-        ref_grays     = auto_result
-        ref_templates = auto_result   # same preprocessed frame used for both
 
+    ref_grays, ref_templates = ref_result
     print(
-        f"[INFO] {len(ref_grays)} reference angle(s) ready.  "
+        f"[INFO] {len(ref_grays)} reference angle(s) captured.  "
         f"Shape: {ref_grays[0].shape}"
     )
 
