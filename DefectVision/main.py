@@ -38,7 +38,6 @@ from config import (
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
 from core.preprocessor    import Preprocessor
-from core.aligner         import Aligner
 from core.inspector       import Inspector
 from core.temporal_filter import TemporalFilter
 from core.visualizer      import Visualizer
@@ -261,14 +260,13 @@ def _run_detection(
     current_roi: tuple,
     ref_grays: list,
     preprocessor: Preprocessor,
-    aligner: Aligner,
     inspector: Inspector,
     match_conf: float,
     best_tpl_idx: int,
 ) -> tuple:
-    """Extract ROI → preprocess → NCC rank → ECC align → inspect.
+    """Extract ROI → preprocess → NCC rank → text-centric inspect.
     All CPU-bound work is here so the main thread is never blocked.
-    Returns (result, roi_bgr, best_ref, best_live_aligned).
+    Returns (result, roi_bgr, best_ref, live_gray).
     """
     roi_bgr   = _grab_roi(frame, current_roi)
     live_gray = preprocessor.process(roi_bgr)
@@ -292,20 +290,17 @@ def _run_detection(
 
     best_result = None
     best_ref    = ref_grays[0]
-    best_live   = live_gray
     for i in check_indices:
-        ref     = ref_grays[i]
-        inspector.set_reference(ref)   # instant after first call — result is cached
-        aligned = aligner.align(ref, live_gray)
-        res     = inspector.inspect(ref, aligned)
+        ref = ref_grays[i]
+        inspector.set_reference(ref)   # instant — result is cached
+        res = inspector.inspect(ref, live_gray)
         if best_result is None or res.defect_score < best_result.defect_score:
             best_result = res
             best_ref    = ref
-            best_live   = aligned
         if best_result.defect_score < INSPECT_EARLY_EXIT_SCORE:
             break
 
-    return best_result, roi_bgr, best_ref, best_live
+    return best_result, roi_bgr, best_ref, live_gray
 
 
 # ====================================================================
@@ -318,7 +313,6 @@ def run_inspection(
     ref_grays: list,
     ref_templates: list,
     preprocessor: Preprocessor,
-    aligner: Aligner,
     inspector: Inspector,
     temporal: TemporalFilter,
     visualizer: Visualizer,
@@ -431,7 +425,7 @@ def run_inspection(
                     det_future = executor.submit(
                         _run_detection,
                         frame.copy(), current_roi, ref_grays[:],
-                        preprocessor, aligner, inspector,
+                        preprocessor, inspector,
                         match_conf, best_tpl_idx,
                     )
 
@@ -537,7 +531,6 @@ def main() -> None:
     print(f"[INFO] Camera ready: {cw}x{ch} @ {cam.get_fps():.0f} fps")
 
     preprocessor = Preprocessor()
-    aligner      = Aligner()
     inspector    = Inspector()
     temporal     = TemporalFilter()
     visualizer   = Visualizer()
@@ -598,7 +591,7 @@ def main() -> None:
     try:
         run_inspection(
             cam, roi, ref_grays, ref_templates,
-            preprocessor, aligner, inspector, temporal, visualizer, logger,
+            preprocessor, inspector, temporal, visualizer, logger,
             position_lock,
         )
     finally:

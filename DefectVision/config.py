@@ -65,8 +65,13 @@ TEXT_MIN_COMPONENT_AREA = 20   # Min connected-component px² counted as real te
 #   PURITY tolerance (extra ink): 2 px absorbs typical stroke-boundary shifts
 #     from frame-to-frame lighting/alignment variation without masking real marks.
 #     1 px was too tight — it let boundary artifacts through as extra-ink clusters.
-TEXT_TOLERANCE_RECALL_PX = 5   # absorbs ~5px residual after ECC from cold start
-TEXT_TOLERANCE_PURITY_PX = 3   # tight enough to catch real smears, forgiving of edge shifts
+TEXT_TOLERANCE_RECALL_PX = 4   # stroke-boundary tolerance inside the text crop
+TEXT_TOLERANCE_PURITY_PX = 2   # tight: catches real smears, rejects aliasing noise
+
+# Margin (px) added around the text bounding box before comparison.
+# Large enough to capture nearby debris; small enough to exclude
+# unrelated background marks on the other side of the ROI.
+TEXT_CROP_MARGIN = 14
 
 # Debris hard override: after extra-ink detection, find connected components.
 # Any single component ≥ this many px² that survived the purity tolerance is
