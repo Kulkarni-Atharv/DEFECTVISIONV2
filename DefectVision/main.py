@@ -39,7 +39,7 @@ from config import (
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
 from core.preprocessor    import Preprocessor
-from core.inspector       import Inspector
+from core.inspector       import Inspector, InspectionResult
 from core.temporal_filter import TemporalFilter
 from core.visualizer      import Visualizer
 from core.position_lock   import PositionLock
@@ -276,6 +276,15 @@ def _run_detection(
         live_gray = cv2.resize(
             live_gray, (ref_grays[0].shape[1], ref_grays[0].shape[0])
         )
+
+    # Early exit: blank ROI — no text visible at all.
+    # Checked before any mode selection so it fires regardless of NCC scores.
+    _live_bin = Inspector._binarize(live_gray, inspector._polarity)
+    if cv2.countNonZero(_live_bin) == 0:
+        _r = InspectionResult()
+        _r.is_text_found       = False
+        _r.is_recognized_angle = False
+        return _r, roi_bgr, ref_grays[0], live_gray
 
     if match_conf >= POSITION_LOCK_SINGLE_REF_CONF:
         check_indices   = [min(best_tpl_idx, len(ref_grays) - 1)]
