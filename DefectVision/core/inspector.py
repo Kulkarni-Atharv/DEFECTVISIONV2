@@ -89,6 +89,11 @@ class Inspector:
         # Cache keyed by (data_ptr, nbytes) — stable for the lifetime of
         # each captured reference array; cleared on reference recapture.
         self._cache: dict[tuple, tuple] = {}
+        # Live-frame binarization cache — reused across all reference comparisons
+        # for the same live frame so binarization runs once per frame, not once per ref.
+        self._live_key:  tuple | None = None
+        self._live_bin:  np.ndarray | None = None
+        self._live_bbox: tuple | None = None
 
     # ------------------------------------------------------------------
     # Reference setup
@@ -106,6 +111,19 @@ class Inspector:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        self._live_key = self._live_bin = self._live_bbox = None
+
+    def precompute_live(self, live: np.ndarray) -> None:
+        """Binarize the live frame once.  inspect() reuses the result for every
+        reference comparison in the same frame — avoids repeating the expensive
+        morphology+Otsu pipeline N times for N references."""
+        key = (live.ctypes.data, live.nbytes)
+        if key == self._live_key:
+            return
+        polarity = self._polarity or self._detect_polarity(live)
+        self._live_bin  = self._binarize(live, polarity)
+        self._live_bbox = Inspector._text_bbox(self._live_bin, TEXT_CROP_MARGIN)
+        self._live_key  = key
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -114,20 +132,29 @@ class Inspector:
         result = InspectionResult()
         H, W   = reference.shape[:2]
 
+        live_key = (live.ctypes.data, live.nbytes)
+
         if reference.shape != live.shape:
             live = cv2.resize(live, (W, H))
 
         if self._ref_bin is None or self._ref_bin.shape != reference.shape:
             self.set_reference(reference)
 
-        ref_bin  = self._ref_bin
-        live_bin = self._binarize(live, self._polarity)
+        ref_bin = self._ref_bin
+
+        # Reuse precomputed live binarization if available (set by precompute_live).
+        # Falls back to computing fresh when the live frame changed or resize occurred.
+        if self._live_key == live_key and self._live_bin is not None:
+            live_bin  = self._live_bin
+            live_bbox = self._live_bbox
+        else:
+            live_bin  = self._binarize(live, self._polarity)
+            live_bbox = Inspector._text_bbox(live_bin, TEXT_CROP_MARGIN)
 
         # ---- Text-centric crop -----------------------------------------
         # Locate text in both images independently, crop to just the text
         # region so positional shift does not affect the comparison.
         ref_bbox  = self._ref_bbox
-        live_bbox = Inspector._text_bbox(live_bin, TEXT_CROP_MARGIN)
 
         if ref_bbox is not None and live_bbox is not None:
             rx, ry, rw, rh = ref_bbox

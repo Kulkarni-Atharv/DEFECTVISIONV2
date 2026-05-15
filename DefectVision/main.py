@@ -433,6 +433,9 @@ def _run_detection(
         # reference selection when texture noise inflated the text bbox.
         check_indices = list(range(len(ref_grays)))
 
+    # Binarize live frame once — reused for every reference comparison.
+    inspector.precompute_live(live_gray)
+
     best_result = None
     best_ref    = ref_grays[0]
     for i in check_indices:
