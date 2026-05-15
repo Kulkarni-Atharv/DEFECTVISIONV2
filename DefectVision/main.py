@@ -326,8 +326,7 @@ def _record_calibration_live(
                     ref_templates.append(gray_raw)
                     print(f"[INFO] Reference {len(ref_grays)} captured.")
                     if len(ref_grays) >= MAX_REFERENCES:
-                        recording = False
-                        print(f"[INFO] {MAX_REFERENCES} references collected — press Q to confirm.")
+                        print(f"[INFO] {MAX_REFERENCES} references collected — press SPACE to stop, Q to confirm.")
 
         display = frame.copy()
         color   = (0, 0, 220) if recording else (0, 220, 255)
