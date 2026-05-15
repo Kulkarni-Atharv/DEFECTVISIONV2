@@ -38,7 +38,6 @@ from config import (
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
     MAX_REFERENCES,
-    REF_MIN_DISTINCTNESS,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -52,8 +51,7 @@ from utils.logger         import DefectLogger
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
 
-REFERENCES_DIR    = "references"
-_REF_BLUR_MIN_VAR = 20.0   # lenient Laplacian variance — filters only heavily blurred frames
+REFERENCES_DIR = "references"
 
 
 def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
@@ -91,28 +89,16 @@ class _FrameGrabber:
         self._t.join(timeout=2.0)
 
 
-def _batch_ncc(live: np.ndarray, refs: list) -> np.ndarray:
-    """Vectorised NCC: score live against all refs in one matrix multiply.
-    ~1 ms for 30 refs at 1/4 scale vs ~9 ms for a Python loop.
-    Returns float32 array of NCC scores, one per reference.
-    """
-    scale = 4
-    h, w  = live.shape[:2]
-    H, W  = max(1, h // scale), max(1, w // scale)
-
-    live_v = cv2.resize(live, (W, H), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
-    live_v -= live_v.mean()
-    live_norm = np.sqrt(np.dot(live_v, live_v))
-
-    ref_mat = np.stack([
-        cv2.resize(r, (W, H), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
-        for r in refs
-    ])                                   # shape: (N, H*W)
-    ref_mat -= ref_mat.mean(axis=1, keepdims=True)
-    ref_norms = np.sqrt((ref_mat * ref_mat).sum(axis=1))
-
-    scores = (ref_mat @ live_v) / (ref_norms * live_norm + 1e-8)
-    return np.clip(scores, 0.0, 1.0).astype(np.float32)
+def _sample_frames(
+    all_grays: list,
+    all_templates: list,
+) -> tuple[list, list]:
+    """Uniformly sample MAX_REFERENCES frames from a full recording."""
+    n = len(all_grays)
+    if n <= MAX_REFERENCES:
+        return all_grays, all_templates
+    indices = np.linspace(0, n - 1, MAX_REFERENCES, dtype=int)
+    return [all_grays[i] for i in indices], [all_templates[i] for i in indices]
 
 
 
@@ -218,55 +204,35 @@ def _extract_refs_from_video(
     roi: tuple,
     preprocessor: Preprocessor,
 ) -> tuple[list, list] | None:
-    """Stream a calibration video, crop to ROI each frame, select up to
-    MAX_REFERENCES structurally distinct sharp frames as references."""
+    """Extract every ROI frame from a video file, then uniformly sample to MAX_REFERENCES."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video: {video_path}")
         return None
 
-    x, y, w, h     = roi
-    ref_grays: list     = []
-    ref_templates: list = []
-    frame_idx       = 0
-    total           = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[INFO] Processing video ({total} frames) ...")
+    x, y, w, h      = roi
+    all_grays: list      = []
+    all_templates: list  = []
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[INFO] Extracting frames from video ({total} frames) ...")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_idx += 1
-
-        # Bounds check — video resolution may differ from camera
         if frame.shape[0] < y + h or frame.shape[1] < x + w:
             continue
-
-        crop     = frame[y:y + h, x:x + w].copy()
-        gray_raw = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
-        # Blur gate — skip heavily motion-blurred frames
-        if cv2.Laplacian(gray_raw, cv2.CV_64F).var() < _REF_BLUR_MIN_VAR:
-            continue
-
-        gray_proc = preprocessor.process(crop)
-
-        # Distinctness gate — only keep frames that look different from existing refs
-        if ref_grays:
-            scores = _batch_ncc(gray_proc, ref_grays)
-            if float(scores.max()) >= REF_MIN_DISTINCTNESS:
-                continue
-
-        ref_grays.append(gray_proc)
-        ref_templates.append(gray_raw)
-        print(f"[INFO]   Frame {frame_idx:4d}: reference {len(ref_grays)} selected")
-
-        if len(ref_grays) >= MAX_REFERENCES:
-            break
+        crop = frame[y:y + h, x:x + w].copy()
+        all_grays.append(preprocessor.process(crop))
+        all_templates.append(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
 
     cap.release()
-    print(f"[INFO] {len(ref_grays)} reference(s) extracted from {frame_idx} frames.")
-    return (ref_grays, ref_templates) if ref_grays else None
+    if not all_grays:
+        return None
+
+    ref_grays, ref_templates = _sample_frames(all_grays, all_templates)
+    print(f"[INFO] {len(ref_grays)} reference(s) sampled from {len(all_grays)} frames.")
+    return ref_grays, ref_templates
 
 
 # ====================================================================
@@ -278,31 +244,21 @@ def _record_calibration_live(
     roi: tuple[int, int, int, int],
     preprocessor: Preprocessor,
 ) -> tuple[list, list] | None:
-    """
-    Live calibration mode — records directly from the camera.
+    """Record live camera feed, collect all ROI frames, uniformly sample to MAX_REFERENCES.
 
-    Shows the camera feed with ROI overlay.  Press SPACE to start/pause
-    recording.  Each frame is processed on the fly:
-      • blur gate  — heavily blurred frames are skipped
-      • NCC gate   — only keeps frames visually distinct from existing refs
-    Stops automatically when MAX_REFERENCES distinct angles are collected.
-    Press Q to confirm.
-
-    Controls
-    --------
-    SPACE  — start / pause recording
-    Q      — confirm and proceed
+    SPACE  — start / stop recording
+    Q      — confirm and use collected frames
     """
-    WIN = "DefectVision — Calibration  [SPACE=record/pause  Q=confirm]"
+    WIN = "DefectVision — Calibration  [SPACE=start/stop  Q=confirm]"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     x, y, w, h = roi
 
-    ref_grays: list     = []
-    ref_templates: list = []
+    all_grays: list     = []
+    all_templates: list = []
     recording           = False
 
     print("[INFO] Calibration: rotate cylinder slowly in front of camera.")
-    print("[INFO] SPACE = start/pause recording   Q = confirm")
+    print("[INFO] SPACE = start/stop recording   Q = confirm")
 
     while True:
         ret, frame = cap.read()
@@ -314,32 +270,18 @@ def _record_calibration_live(
         gray_raw = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
         if recording:
-            lap_var = cv2.Laplacian(gray_raw, cv2.CV_64F).var()
-            if lap_var >= _REF_BLUR_MIN_VAR:
-                gray_proc = preprocessor.process(crop)
-                add = True
-                if ref_grays:
-                    scores = _batch_ncc(gray_proc, ref_grays)
-                    if float(scores.max()) >= REF_MIN_DISTINCTNESS:
-                        add = False
-                if add:
-                    ref_grays.append(gray_proc)
-                    ref_templates.append(gray_raw)
-                    print(f"[INFO] Reference {len(ref_grays)} captured.")
-                    if len(ref_grays) >= MAX_REFERENCES:
-                        print(f"[INFO] {MAX_REFERENCES} references collected — press SPACE to stop, Q to confirm.")
+            all_grays.append(preprocessor.process(crop))
+            all_templates.append(gray_raw)
 
         display = frame.copy()
         color   = (0, 0, 220) if recording else (0, 220, 255)
         cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
 
         if recording:
-            cv2.circle(display, (20, 20), 10, (0, 0, 255), -1)  # red dot
-
-        if recording:
-            label = f"RECORDING  {len(ref_grays)}/{MAX_REFERENCES} refs  |  SPACE=pause  Q=confirm"
-        elif ref_grays:
-            label = f"{len(ref_grays)}/{MAX_REFERENCES} refs captured  |  SPACE=record more  Q=confirm"
+            cv2.circle(display, (20, 20), 10, (0, 0, 255), -1)
+            label = f"RECORDING  {len(all_grays)} frames  |  SPACE=stop  Q=confirm"
+        elif all_grays:
+            label = f"{len(all_grays)} frames recorded  |  SPACE=record more  Q=confirm"
         else:
             label = "Press SPACE to start — rotate cylinder slowly past camera"
 
@@ -350,11 +292,17 @@ def _record_calibration_live(
         key = cv2.waitKey(1) & 0xFF
         if key == ord(' '):
             recording = not recording
-            state = "started" if recording else "paused"
-            print(f"[INFO] Recording {state} — {len(ref_grays)} ref(s) so far.")
+            if recording:
+                print("[INFO] Recording started ...")
+            else:
+                print(f"[INFO] Recording stopped — {len(all_grays)} frames collected.")
         elif key == ord('q'):
             cv2.destroyWindow(WIN)
-            return (ref_grays, ref_templates) if ref_grays else None
+            if not all_grays:
+                return None
+            ref_grays, ref_templates = _sample_frames(all_grays, all_templates)
+            print(f"[INFO] {len(ref_grays)} reference(s) sampled from {len(all_grays)} frames.")
+            return ref_grays, ref_templates
 
 
 # ====================================================================
