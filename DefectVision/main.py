@@ -3,7 +3,8 @@ DefectVision — Real-time print defect inspection
 ================================================
 Entry point.  Run with:
     python main.py
-    python main.py --roi 100 50 400 200   # skip GUI ROI selector
+    python main.py --roi 100 50 400 200        # skip GUI ROI selector
+    python main.py --video calibration.mp4     # extract references from video
 
 Key bindings during reference capture:
     SPACE  — capture this angle (averages several frames)
@@ -12,7 +13,8 @@ Key bindings during reference capture:
 
 Key bindings during inspection:
     Q      — quit
-    R      — recapture references (place clean sample first)
+    R      — recapture references manually (place clean sample first)
+    V      — extract references from a video file
     S      — save snapshot of current live ROI to logs/
     SPACE  — pause / resume
 """
@@ -34,6 +36,8 @@ from config import (
     POSITION_LOCK_ENABLED,
     INSPECT_EARLY_EXIT_SCORE,
     POSITION_LOCK_SINGLE_REF_CONF,
+    MAX_REFERENCES,
+    REF_MIN_DISTINCTNESS,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -46,6 +50,9 @@ from utils.logger         import DefectLogger
 
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
+
+REFERENCES_DIR    = "references"
+_REF_BLUR_MIN_VAR = 20.0   # lenient Laplacian variance — filters only heavily blurred frames
 
 
 def _grab_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
@@ -154,6 +161,110 @@ def _save_reference_images(
         cv2.imwrite(os.path.join(save_dir, f"angle_{i+1:02d}_preprocessed.png"), gray)
         cv2.imwrite(os.path.join(save_dir, f"angle_{i+1:02d}_raw.png"), tpl)
     print(f"[INFO] Reference images saved to: {save_dir}")
+
+
+# ====================================================================
+# Reference persistence — save / load from disk
+# ====================================================================
+
+def _save_refs_to_disk(
+    ref_grays: list,
+    ref_templates: list,
+    roi: tuple,
+) -> None:
+    os.makedirs(REFERENCES_DIR, exist_ok=True)
+    with open(os.path.join(REFERENCES_DIR, "roi.txt"), "w") as f:
+        f.write(f"{roi[0]} {roi[1]} {roi[2]} {roi[3]}\n")
+    for i, (gray, tpl) in enumerate(zip(ref_grays, ref_templates)):
+        cv2.imwrite(os.path.join(REFERENCES_DIR, f"ref_gray_{i}.png"),     gray)
+        cv2.imwrite(os.path.join(REFERENCES_DIR, f"ref_template_{i}.png"), tpl)
+    print(f"[INFO] {len(ref_grays)} reference(s) saved to '{REFERENCES_DIR}/'")
+
+
+def _load_refs_from_disk(roi: tuple) -> tuple[list, list] | None:
+    roi_file = os.path.join(REFERENCES_DIR, "roi.txt")
+    if not os.path.exists(roi_file):
+        return None
+    with open(roi_file) as f:
+        saved_roi = tuple(int(v) for v in f.read().split())
+    if saved_roi != tuple(roi):
+        print(f"[WARN] Saved references are for ROI {saved_roi}, current ROI is {tuple(roi)} — ignoring.")
+        return None
+    ref_grays: list     = []
+    ref_templates: list = []
+    i = 0
+    while True:
+        gp = os.path.join(REFERENCES_DIR, f"ref_gray_{i}.png")
+        tp = os.path.join(REFERENCES_DIR, f"ref_template_{i}.png")
+        if not os.path.exists(gp):
+            break
+        gray = cv2.imread(gp, cv2.IMREAD_GRAYSCALE)
+        tpl  = cv2.imread(tp, cv2.IMREAD_GRAYSCALE)
+        if gray is None or tpl is None:
+            break
+        ref_grays.append(gray)
+        ref_templates.append(tpl)
+        i += 1
+    if not ref_grays:
+        return None
+    print(f"[INFO] Loaded {len(ref_grays)} reference(s) from '{REFERENCES_DIR}/'")
+    return ref_grays, ref_templates
+
+
+def _extract_refs_from_video(
+    video_path: str,
+    roi: tuple,
+    preprocessor: Preprocessor,
+) -> tuple[list, list] | None:
+    """Stream a calibration video, crop to ROI each frame, select up to
+    MAX_REFERENCES structurally distinct sharp frames as references."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video: {video_path}")
+        return None
+
+    x, y, w, h     = roi
+    ref_grays: list     = []
+    ref_templates: list = []
+    frame_idx       = 0
+    total           = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[INFO] Processing video ({total} frames) ...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+
+        # Bounds check — video resolution may differ from camera
+        if frame.shape[0] < y + h or frame.shape[1] < x + w:
+            continue
+
+        crop     = frame[y:y + h, x:x + w].copy()
+        gray_raw = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # Blur gate — skip heavily motion-blurred frames
+        if cv2.Laplacian(gray_raw, cv2.CV_64F).var() < _REF_BLUR_MIN_VAR:
+            continue
+
+        gray_proc = preprocessor.process(crop)
+
+        # Distinctness gate — only keep frames that look different from existing refs
+        if ref_grays:
+            scores = _batch_ncc(gray_proc, ref_grays)
+            if float(scores.max()) >= REF_MIN_DISTINCTNESS:
+                continue
+
+        ref_grays.append(gray_proc)
+        ref_templates.append(gray_raw)
+        print(f"[INFO]   Frame {frame_idx:4d}: reference {len(ref_grays)} selected")
+
+        if len(ref_grays) >= MAX_REFERENCES:
+            break
+
+    cap.release()
+    print(f"[INFO] {len(ref_grays)} reference(s) extracted from {frame_idx} frames.")
+    return (ref_grays, ref_templates) if ref_grays else None
 
 
 # ====================================================================
@@ -353,7 +464,7 @@ def run_inspection(
     det_future       = None
 
     grabber = _FrameGrabber(cap)
-    print("[INFO] Inspection running.  Q=quit  R=new reference  S=snapshot  SPACE=pause")
+    print("[INFO] Inspection running.  Q=quit  R=recapture  V=video refs  S=snapshot  SPACE=pause")
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         while True:
@@ -496,6 +607,44 @@ def run_inspection(
                 cv2.imwrite(snap_path, last_roi_bgr)
                 print(f"[INFO] Snapshot saved: {snap_path}")
 
+            elif key == ord('v'):
+                print("[INPUT] Enter calibration video path: ", end='', flush=True)
+                video_path = input().strip()
+                if not os.path.exists(video_path):
+                    print(f"[WARN] File not found: {video_path}")
+                else:
+                    if det_future is not None:
+                        try:
+                            det_future.result(timeout=2.0)
+                        except Exception:
+                            pass
+                        det_future = None
+                    grabber.stop()
+                    vid_result = _extract_refs_from_video(video_path, roi, preprocessor)
+                    grabber = _FrameGrabber(cap)
+                    if vid_result is not None:
+                        ref_grays[:], ref_templates[:] = vid_result
+                        _save_refs_to_disk(ref_grays, ref_templates, roi)
+                        inspector.clear_cache()
+                        for _r in ref_grays:
+                            inspector.set_reference(_r)
+                        temporal.reset()
+                        if position_lock is not None:
+                            focused_tpls = []
+                            tpl_offsets  = []
+                            for rg, rt in zip(ref_grays, ref_templates):
+                                tpl, off = _focused_template(rg, rt)
+                                focused_tpls.append(tpl)
+                                tpl_offsets.append(off)
+                            position_lock.update_template(
+                                focused_tpls,
+                                roi_offsets   = tpl_offsets,
+                                full_roi_size = (roi[2], roi[3]),
+                            )
+                        print(f"[INFO] References updated from video: {len(ref_grays)} angle(s).")
+                    else:
+                        print("[WARN] No usable references extracted from video.")
+
     grabber.stop()
     cv2.destroyAllWindows()
 
@@ -509,6 +658,10 @@ def main() -> None:
     parser.add_argument(
         "--roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
         help="Skip GUI ROI selector  e.g. --roi 100 50 400 200"
+    )
+    parser.add_argument(
+        "--video", metavar="PATH",
+        help="Extract references from a calibration video instead of manual capture"
     )
     args = parser.parse_args()
 
@@ -551,16 +704,31 @@ def main() -> None:
     x, y, rw, rh = roi
     print(f"[INFO] ROI: x={x} y={y} w={rw} h={rh}")
 
-    # ---- Step 2: Capture references at each expected angle --------------
-    print("[INFO] Step 2: Capture reference at each expected angle.")
-    print("[INFO]   Position clean print in ROI → SPACE to capture → repeat → Q to confirm")
-    ref_result = capture_reference_multi(cam, roi, preprocessor)
-    if ref_result is None:
-        print("[INFO] Reference capture cancelled.  Exiting.")
-        cam.release()
-        sys.exit(0)
-
-    ref_grays, ref_templates = ref_result
+    # ---- Step 2: Load saved refs, or extract from video, or manual capture
+    ref_result = _load_refs_from_disk(roi)
+    if ref_result is not None:
+        ref_grays, ref_templates = ref_result
+        print(f"[INFO] Using {len(ref_grays)} saved reference(s).  Press R to recapture manually, V to use a video.")
+    elif args.video:
+        print(f"[INFO] Step 2: Extracting references from video: {args.video}")
+        ref_result = _extract_refs_from_video(args.video, roi, preprocessor)
+        if ref_result is None:
+            print("[INFO] No usable references extracted from video.  Exiting.")
+            cam.release()
+            sys.exit(0)
+        ref_grays, ref_templates = ref_result
+        _save_refs_to_disk(ref_grays, ref_templates, roi)
+    else:
+        print("[INFO] Step 2: Capture reference at each expected angle.")
+        print("[INFO]   Position clean print in ROI → SPACE to capture → repeat → Q to confirm")
+        print("[INFO]   Tip: next run will load these automatically.  Press V in inspection to use a video.")
+        ref_result = capture_reference_multi(cam, roi, preprocessor)
+        if ref_result is None:
+            print("[INFO] Reference capture cancelled.  Exiting.")
+            cam.release()
+            sys.exit(0)
+        ref_grays, ref_templates = ref_result
+        _save_refs_to_disk(ref_grays, ref_templates, roi)
     print(
         f"[INFO] {len(ref_grays)} reference angle(s) captured.  "
         f"Shape: {ref_grays[0].shape}"
