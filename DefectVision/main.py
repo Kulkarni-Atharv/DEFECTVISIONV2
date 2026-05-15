@@ -13,8 +13,9 @@ Key bindings during reference capture:
 
 Key bindings during inspection:
     Q      — quit
-    R      — recapture references manually (place clean sample first)
-    V      — extract references from a video file
+    C      — recalibrate (live camera recording — rotate cylinder)
+    R      — recapture references manually (SPACE at each angle)
+    V      — extract references from a saved video file
     S      — save snapshot of current live ROI to logs/
     SPACE  — pause / resume
 """
@@ -268,6 +269,95 @@ def _extract_refs_from_video(
 
 
 # ====================================================================
+# Reference capture — live camera recording
+# ====================================================================
+
+def _record_calibration_live(
+    cap,
+    roi: tuple[int, int, int, int],
+    preprocessor: Preprocessor,
+) -> tuple[list, list] | None:
+    """
+    Live calibration mode — records directly from the camera.
+
+    Shows the camera feed with ROI overlay.  Press SPACE to start/pause
+    recording.  Each frame is processed on the fly:
+      • blur gate  — heavily blurred frames are skipped
+      • NCC gate   — only keeps frames visually distinct from existing refs
+    Stops automatically when MAX_REFERENCES distinct angles are collected.
+    Press Q to confirm.
+
+    Controls
+    --------
+    SPACE  — start / pause recording
+    Q      — confirm and proceed
+    """
+    WIN = "DefectVision — Calibration  [SPACE=record/pause  Q=confirm]"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    x, y, w, h = roi
+
+    ref_grays: list     = []
+    ref_templates: list = []
+    recording           = False
+
+    print("[INFO] Calibration: rotate cylinder slowly in front of camera.")
+    print("[INFO] SPACE = start/pause recording   Q = confirm")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cv2.waitKey(1)
+            continue
+
+        crop     = frame[y:y + h, x:x + w].copy()
+        gray_raw = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        if recording:
+            lap_var = cv2.Laplacian(gray_raw, cv2.CV_64F).var()
+            if lap_var >= _REF_BLUR_MIN_VAR:
+                gray_proc = preprocessor.process(crop)
+                add = True
+                if ref_grays:
+                    scores = _batch_ncc(gray_proc, ref_grays)
+                    if float(scores.max()) >= REF_MIN_DISTINCTNESS:
+                        add = False
+                if add:
+                    ref_grays.append(gray_proc)
+                    ref_templates.append(gray_raw)
+                    print(f"[INFO] Reference {len(ref_grays)} captured.")
+                    if len(ref_grays) >= MAX_REFERENCES:
+                        recording = False
+                        print(f"[INFO] {MAX_REFERENCES} references collected — press Q to confirm.")
+
+        display = frame.copy()
+        color   = (0, 0, 220) if recording else (0, 220, 255)
+        cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
+
+        if recording:
+            cv2.circle(display, (20, 20), 10, (0, 0, 255), -1)  # red dot
+
+        if recording:
+            label = f"RECORDING  {len(ref_grays)}/{MAX_REFERENCES} refs  |  SPACE=pause  Q=confirm"
+        elif ref_grays:
+            label = f"{len(ref_grays)}/{MAX_REFERENCES} refs captured  |  SPACE=record more  Q=confirm"
+        else:
+            label = "Press SPACE to start — rotate cylinder slowly past camera"
+
+        cv2.putText(display, label, (40, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
+        cv2.imshow(WIN, display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord(' '):
+            recording = not recording
+            state = "started" if recording else "paused"
+            print(f"[INFO] Recording {state} — {len(ref_grays)} ref(s) so far.")
+        elif key == ord('q'):
+            cv2.destroyWindow(WIN)
+            return (ref_grays, ref_templates) if ref_grays else None
+
+
+# ====================================================================
 # Reference capture — manual multi-angle
 # ====================================================================
 
@@ -464,7 +554,7 @@ def run_inspection(
     det_future       = None
 
     grabber = _FrameGrabber(cap)
-    print("[INFO] Inspection running.  Q=quit  R=recapture  V=video refs  S=snapshot  SPACE=pause")
+    print("[INFO] Inspection running.  Q=quit  C=recalibrate  R=manual recapture  V=video file  S=snapshot  SPACE=pause")
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         while True:
@@ -565,6 +655,40 @@ def run_inspection(
             elif key == ord(' '):
                 paused = not paused
                 print(f"[INFO] {'Paused' if paused else 'Resumed'}")
+
+            elif key == ord('c'):
+                print("[INFO] Recalibrating — rotate clean cylinder past camera ...")
+                if det_future is not None:
+                    try:
+                        det_future.result(timeout=2.0)
+                    except Exception:
+                        pass
+                    det_future = None
+                grabber.stop()
+                cal_result = _record_calibration_live(cap, roi, preprocessor)
+                grabber = _FrameGrabber(cap)
+                if cal_result is not None:
+                    ref_grays[:], ref_templates[:] = cal_result
+                    _save_refs_to_disk(ref_grays, ref_templates, roi)
+                    inspector.clear_cache()
+                    for _r in ref_grays:
+                        inspector.set_reference(_r)
+                    temporal.reset()
+                    if position_lock is not None:
+                        focused_tpls = []
+                        tpl_offsets  = []
+                        for rg, rt in zip(ref_grays, ref_templates):
+                            tpl, off = _focused_template(rg, rt)
+                            focused_tpls.append(tpl)
+                            tpl_offsets.append(off)
+                        position_lock.update_template(
+                            focused_tpls,
+                            roi_offsets   = tpl_offsets,
+                            full_roi_size = (roi[2], roi[3]),
+                        )
+                    print(f"[INFO] Calibration complete: {len(ref_grays)} angle(s) saved.")
+                else:
+                    print("[INFO] Calibration cancelled — keeping previous references.")
 
             elif key == ord('r'):
                 print("[INFO] Recapturing references — position clean sample in ROI ...")
@@ -719,12 +843,11 @@ def main() -> None:
         ref_grays, ref_templates = ref_result
         _save_refs_to_disk(ref_grays, ref_templates, roi)
     else:
-        print("[INFO] Step 2: Capture reference at each expected angle.")
-        print("[INFO]   Position clean print in ROI → SPACE to capture → repeat → Q to confirm")
-        print("[INFO]   Tip: next run will load these automatically.  Press V in inspection to use a video.")
-        ref_result = capture_reference_multi(cam, roi, preprocessor)
+        print("[INFO] Step 2: Calibration — rotate clean cylinder slowly past the camera.")
+        print("[INFO]   SPACE=start/pause recording   Q=confirm   (auto-stops at max angles)")
+        ref_result = _record_calibration_live(cam, roi, preprocessor)
         if ref_result is None:
-            print("[INFO] Reference capture cancelled.  Exiting.")
+            print("[INFO] Calibration cancelled.  Exiting.")
             cam.release()
             sys.exit(0)
         ref_grays, ref_templates = ref_result
