@@ -39,6 +39,7 @@ from config import (
     POSITION_LOCK_SINGLE_REF_CONF,
     MAX_REFERENCES,
     REF_MIN_DISTINCTNESS,
+    TEXT_CROP_MARGIN,
 )
 from core.camera          import create_camera
 from core.roi_selector    import ROISelector
@@ -112,6 +113,66 @@ def _batch_ncc(live: np.ndarray, refs: list) -> np.ndarray:
     ref_norms = np.sqrt((ref_mat * ref_mat).sum(axis=1))
 
     scores = (ref_mat @ live_v) / (ref_norms * live_norm + 1e-8)
+    return np.clip(scores, 0.0, 1.0).astype(np.float32)
+
+
+def _batch_ncc_text(
+    live_gray: np.ndarray,
+    ref_grays: list,
+    inspector: Inspector,
+) -> np.ndarray:
+    """NCC on binarised text crops — position-invariant reference selection.
+
+    Finds the text bbox in the live frame and in each reference independently,
+    crops to just the ink region, resizes all crops to the same size, then
+    computes NCC.  This means the score reflects text SHAPE similarity, not
+    where the text sits in the frame.
+
+    Falls back to full-image NCC if no text is detected in the live frame.
+    """
+    live_polarity = Inspector._detect_polarity(live_gray)
+    live_bin      = Inspector._binarize(live_gray, live_polarity)
+    live_bbox     = Inspector._text_bbox(live_bin, TEXT_CROP_MARGIN)
+
+    if live_bbox is None:
+        return _batch_ncc(live_gray, ref_grays)
+
+    lx, ly, lw, lh = live_bbox
+    tw = max(lw, 32)
+    th = max(lh, 32)
+
+    live_v  = cv2.resize(
+        live_bin[ly:ly + lh, lx:lx + lw].astype(np.float32),
+        (tw, th), interpolation=cv2.INTER_NEAREST,
+    ).ravel()
+    live_v -= live_v.mean()
+    live_norm = np.sqrt(np.dot(live_v, live_v) + 1e-8)
+
+    ref_vecs = []
+    for ref in ref_grays:
+        key = (ref.ctypes.data, ref.nbytes)
+        if key in inspector._cache:
+            ref_bin, _, _, ref_bbox = inspector._cache[key]
+        else:
+            ref_pol  = Inspector._detect_polarity(ref)
+            ref_bin  = Inspector._binarize(ref, ref_pol)
+            ref_bbox = Inspector._text_bbox(ref_bin, TEXT_CROP_MARGIN)
+
+        if ref_bbox is None:
+            ref_vecs.append(np.zeros(tw * th, dtype=np.float32))
+            continue
+
+        rx, ry, rw, rh = ref_bbox
+        rv  = cv2.resize(
+            ref_bin[ry:ry + rh, rx:rx + rw].astype(np.float32),
+            (tw, th), interpolation=cv2.INTER_NEAREST,
+        ).ravel()
+        rv -= rv.mean()
+        ref_vecs.append(rv)
+
+    ref_mat   = np.stack(ref_vecs)
+    ref_norms = np.sqrt((ref_mat * ref_mat).sum(axis=1) + 1e-8)
+    scores    = (ref_mat @ live_v) / (ref_norms * live_norm)
     return np.clip(scores, 0.0, 1.0).astype(np.float32)
 
 
@@ -484,7 +545,7 @@ def _run_detection(
         # Vectorised batch NCC ranks all refs in ~1ms regardless of N.
         # Cap to top-2: with good NCC ranking the right reference is always
         # in the top-2, so we never need to run ECC on angles 3-30.
-        ncc_scores    = _batch_ncc(live_gray, ref_grays)
+        ncc_scores    = _batch_ncc_text(live_gray, ref_grays, inspector)
         top2          = np.argsort(ncc_scores)[::-1][:2].tolist()
         check_indices = top2
 
