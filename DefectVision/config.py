@@ -79,7 +79,7 @@ TEXT_CROP_MARGIN = 14
 # regardless of composite score.
 # 30 px² ≈ a 6×5 compact mark — well below any user-visible dot (~5 px radius
 # = 78 px²) but above stroke-boundary noise strips (typically thin and < 20 px²).
-DEBRIS_MIN_COMPONENT_AREA = 5    # lowered from 10 — catch micro-level marks (~2×3 px) via hard override
+DEBRIS_MIN_COMPONENT_AREA = 8    # 5 was catching diagonal stroke-boundary aliasing on 'x'; 8 px² still catches real marks
 
 # Legacy adaptive-threshold params (no longer used; kept for reference)
 ADAPTIVE_BLOCK_SIZE     = 31
@@ -115,8 +115,8 @@ REF_MIN_DISTINCTNESS = 0.80  # NCC threshold: frame added only when NCC vs
                               # every already-selected ref is below this value
 
 # ---- Temporal consistency filter ----------------------------
-TEMPORAL_WINDOW       = 6      # Rolling window length (frames)
-TEMPORAL_DEFECT_RATIO = 0.50   # Fraction of window frames that must flag defect
+TEMPORAL_WINDOW       = 8      # Increased from 6 — more frames needed for consensus, reduces transient false positives
+TEMPORAL_DEFECT_RATIO = 0.65   # Raised from 0.50 — 65% of window must agree before flagging
 
 # ---- Visualization ------------------------------------------
 HEATMAP_ALPHA        = 0.45    # 0 = no heatmap overlay, 1 = full
