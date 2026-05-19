@@ -51,6 +51,7 @@ from utils.logger         import DefectLogger
 import os
 os.makedirs(LOG_DIR, exist_ok=True)
 
+
 REFERENCES_DIR = "references"
 
 
