@@ -79,7 +79,7 @@ TEXT_CROP_MARGIN = 14
 # regardless of composite score.
 # 30 px² ≈ a 6×5 compact mark — well below any user-visible dot (~5 px radius
 # = 78 px²) but above stroke-boundary noise strips (typically thin and < 20 px²).
-DEBRIS_MIN_COMPONENT_AREA = 10   # lowered from 20 — catch small dots (~3×3 px) visible in pixel diff panel
+DEBRIS_MIN_COMPONENT_AREA = 5    # lowered from 10 — catch micro-level marks (~2×3 px) via hard override
 
 # Legacy adaptive-threshold params (no longer used; kept for reference)
 ADAPTIVE_BLOCK_SIZE     = 31
@@ -92,7 +92,7 @@ PURITY_WEIGHT = 0.25           # Extra ink / smear / debris
 NCC_WEIGHT    = 0.25           # Overall structural shape mismatch
 
 # ---- Defect decision ----------------------------------------
-DEFECT_SCORE_THRESHOLD = 0.10  # lowered from 0.20 — score of 0.124 was passing despite visible extra ink
+DEFECT_SCORE_THRESHOLD = 0.05  # lowered from 0.10 — catches micro-debris scores ~0.051-0.057; aligned with INSPECT_EARLY_EXIT_SCORE
 
 # Multi-reference early exit: when checking multiple references per frame,
 # stop as soon as one scores below this value — the print is clearly clean.
